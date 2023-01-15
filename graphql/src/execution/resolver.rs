@@ -1,4 +1,5 @@
 use graph::components::store::UnitStream;
+use graph::data::query::Trace;
 use graph::prelude::{async_trait, s, tokio, ApiSchema, Error, QueryExecutionError};
 use graph::{
     data::graphql::ObjectOrInterface,
@@ -12,17 +13,17 @@ use crate::execution::{ast as a, ExecutionContext};
 pub trait Resolver: Sized + Send + Sync + 'static {
     const CACHEABLE: bool;
 
-    async fn query_permit(&self) -> tokio::sync::OwnedSemaphorePermit;
+    async fn query_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, QueryExecutionError>;
 
     /// Prepare for executing a query by prefetching as much data as possible
     fn prefetch(
         &self,
         ctx: &ExecutionContext<Self>,
         selection_set: &a::SelectionSet,
-    ) -> Result<Option<r::Value>, Vec<QueryExecutionError>>;
+    ) -> Result<(Option<r::Value>, Trace), Vec<QueryExecutionError>>;
 
     /// Resolves list of objects, `prefetched_objects` is `Some` if the parent already calculated the value.
-    fn resolve_objects(
+    async fn resolve_objects(
         &self,
         prefetched_objects: Option<r::Value>,
         field: &a::Field,
@@ -31,7 +32,7 @@ pub trait Resolver: Sized + Send + Sync + 'static {
     ) -> Result<r::Value, QueryExecutionError>;
 
     /// Resolves an object, `prefetched_object` is `Some` if the parent already calculated the value.
-    fn resolve_object(
+    async fn resolve_object(
         &self,
         prefetched_object: Option<r::Value>,
         field: &a::Field,
@@ -50,7 +51,7 @@ pub trait Resolver: Sized + Send + Sync + 'static {
     }
 
     /// Resolves a scalar value for a given scalar type.
-    fn resolve_scalar_value(
+    async fn resolve_scalar_value(
         &self,
         _parent_object_type: &s::ObjectType,
         _field: &a::Field,

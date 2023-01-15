@@ -1,34 +1,27 @@
 use std::cmp::PartialEq;
-use std::str::FromStr;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use futures::sync::mpsc::Sender;
 use futures03::channel::oneshot::channel;
-use graph::blockchain::RuntimeAdapter;
-use graph::blockchain::{Blockchain, DataSource};
-use graph::blockchain::{HostFn, TriggerWithHandler};
-use graph::components::store::EnsLookup;
+
+use graph::blockchain::{Blockchain, HostFn, RuntimeAdapter};
+use graph::components::store::{EnsLookup, SubgraphFork};
 use graph::components::subgraph::{MappingError, SharedProofOfIndexing};
+use graph::data_source::{
+    DataSource, DataSourceTemplate, MappingTrigger, TriggerData, TriggerWithHandler,
+};
 use graph::prelude::{
     RuntimeHost as RuntimeHostTrait, RuntimeHostBuilder as RuntimeHostBuilderTrait, *,
 };
 
 use crate::mapping::{MappingContext, MappingRequest};
+use crate::module::ToAscPtr;
 use crate::{host_exports::HostExports, module::ExperimentalFeatures};
 use graph::runtime::gas::Gas;
 
-lazy_static! {
-    static ref TIMEOUT: Option<Duration> = std::env::var("GRAPH_MAPPING_HANDLER_TIMEOUT")
-        .ok()
-        .map(|s| u64::from_str(&s).expect("Invalid value for GRAPH_MAPPING_HANDLER_TIMEOUT"))
-        .map(Duration::from_secs);
-    static ref ALLOW_NON_DETERMINISTIC_IPFS: bool =
-        std::env::var("GRAPH_ALLOW_NON_DETERMINISTIC_IPFS").is_ok();
-}
-
 pub struct RuntimeHostBuilder<C: Blockchain> {
-    runtime_adapter: Arc<C::RuntimeAdapter>,
+    runtime_adapter: Arc<dyn RuntimeAdapter<C>>,
     link_resolver: Arc<dyn LinkResolver>,
     ens_lookup: Arc<dyn EnsLookup>,
 }
@@ -45,7 +38,7 @@ impl<C: Blockchain> Clone for RuntimeHostBuilder<C> {
 
 impl<C: Blockchain> RuntimeHostBuilder<C> {
     pub fn new(
-        runtime_adapter: Arc<C::RuntimeAdapter>,
+        runtime_adapter: Arc<dyn RuntimeAdapter<C>>,
         link_resolver: Arc<dyn LinkResolver>,
         ens_lookup: Arc<dyn EnsLookup>,
     ) -> Self {
@@ -57,18 +50,21 @@ impl<C: Blockchain> RuntimeHostBuilder<C> {
     }
 }
 
-impl<C: Blockchain> RuntimeHostBuilderTrait<C> for RuntimeHostBuilder<C> {
+impl<C: Blockchain> RuntimeHostBuilderTrait<C> for RuntimeHostBuilder<C>
+where
+    <C as Blockchain>::MappingTrigger: ToAscPtr,
+{
     type Host = RuntimeHost<C>;
     type Req = MappingRequest<C>;
 
     fn spawn_mapping(
-        raw_module: Vec<u8>,
+        raw_module: &[u8],
         logger: Logger,
         subgraph_id: DeploymentHash,
         metrics: Arc<HostMetrics>,
     ) -> Result<Sender<Self::Req>, Error> {
         let experimental_features = ExperimentalFeatures {
-            allow_non_deterministic_ipfs: *ALLOW_NON_DETERMINISTIC_IPFS,
+            allow_non_deterministic_ipfs: ENV_VARS.mappings.allow_non_deterministic_ipfs,
         };
         crate::mapping::spawn_module(
             raw_module,
@@ -76,7 +72,7 @@ impl<C: Blockchain> RuntimeHostBuilderTrait<C> for RuntimeHostBuilder<C> {
             subgraph_id,
             metrics,
             tokio::runtime::Handle::current(),
-            *TIMEOUT,
+            ENV_VARS.mappings.timeout,
             experimental_features,
         )
     }
@@ -85,8 +81,8 @@ impl<C: Blockchain> RuntimeHostBuilderTrait<C> for RuntimeHostBuilder<C> {
         &self,
         network_name: String,
         subgraph_id: DeploymentHash,
-        data_source: C::DataSource,
-        templates: Arc<Vec<C::DataSourceTemplate>>,
+        data_source: DataSource<C>,
+        templates: Arc<Vec<DataSourceTemplate<C>>>,
         mapping_request_sender: Sender<MappingRequest<C>>,
         metrics: Arc<HostMetrics>,
     ) -> Result<Self::Host, Error> {
@@ -106,7 +102,7 @@ impl<C: Blockchain> RuntimeHostBuilderTrait<C> for RuntimeHostBuilder<C> {
 
 pub struct RuntimeHost<C: Blockchain> {
     host_fns: Arc<Vec<HostFn>>,
-    data_source: C::DataSource,
+    data_source: DataSource<C>,
     mapping_request_sender: Sender<MappingRequest<C>>,
     host_exports: Arc<HostExports<C>>,
     metrics: Arc<HostMetrics>,
@@ -117,12 +113,12 @@ where
     C: Blockchain,
 {
     fn new(
-        runtime_adapter: Arc<C::RuntimeAdapter>,
+        runtime_adapter: Arc<dyn RuntimeAdapter<C>>,
         link_resolver: Arc<dyn LinkResolver>,
         network_name: String,
         subgraph_id: DeploymentHash,
-        data_source: C::DataSource,
-        templates: Arc<Vec<C::DataSourceTemplate>>,
+        data_source: DataSource<C>,
+        templates: Arc<Vec<DataSourceTemplate<C>>>,
         mapping_request_sender: Sender<MappingRequest<C>>,
         metrics: Arc<HostMetrics>,
         ens_lookup: Arc<dyn EnsLookup>,
@@ -138,10 +134,14 @@ where
             ens_lookup,
         ));
 
-        let host_fns = Arc::new(runtime_adapter.host_fns(&data_source)?);
+        let host_fns = data_source
+            .as_onchain()
+            .map(|ds| runtime_adapter.host_fns(ds))
+            .transpose()?
+            .unwrap_or_default();
 
         Ok(RuntimeHost {
-            host_fns,
+            host_fns: Arc::new(host_fns),
             data_source,
             mapping_request_sender,
             host_exports,
@@ -155,9 +155,10 @@ where
         &self,
         logger: &Logger,
         state: BlockState<C>,
-        trigger: TriggerWithHandler<C>,
+        trigger: TriggerWithHandler<MappingTrigger<C>>,
         block_ptr: BlockPtr,
         proof_of_indexing: SharedProofOfIndexing,
+        debug_fork: &Option<Arc<dyn SubgraphFork>>,
     ) -> Result<BlockState<C>, MappingError> {
         let handler = trigger.handler_name().to_string();
 
@@ -183,6 +184,7 @@ where
                     block_ptr,
                     proof_of_indexing,
                     host_fns: self.host_fns.cheap_clone(),
+                    debug_fork: debug_fork.cheap_clone(),
                 },
                 trigger,
                 result_sender,
@@ -216,12 +218,16 @@ where
 
 #[async_trait]
 impl<C: Blockchain> RuntimeHostTrait<C> for RuntimeHost<C> {
+    fn data_source(&self) -> &DataSource<C> {
+        &self.data_source
+    }
+
     fn match_and_decode(
         &self,
-        trigger: &C::TriggerData,
-        block: Arc<C::Block>,
+        trigger: &TriggerData<C>,
+        block: &Arc<C::Block>,
         logger: &Logger,
-    ) -> Result<Option<TriggerWithHandler<C>>, Error> {
+    ) -> Result<Option<TriggerWithHandler<MappingTrigger<C>>>, Error> {
         self.data_source.match_and_decode(trigger, block, logger)
     }
 
@@ -229,16 +235,40 @@ impl<C: Blockchain> RuntimeHostTrait<C> for RuntimeHost<C> {
         &self,
         logger: &Logger,
         block_ptr: BlockPtr,
-        trigger: TriggerWithHandler<C>,
+        trigger: TriggerWithHandler<MappingTrigger<C>>,
         state: BlockState<C>,
         proof_of_indexing: SharedProofOfIndexing,
+        debug_fork: &Option<Arc<dyn SubgraphFork>>,
     ) -> Result<BlockState<C>, MappingError> {
-        self.send_mapping_request(logger, state, trigger, block_ptr, proof_of_indexing)
-            .await
+        self.send_mapping_request(
+            logger,
+            state,
+            trigger,
+            block_ptr,
+            proof_of_indexing,
+            debug_fork,
+        )
+        .await
     }
 
     fn creation_block_number(&self) -> Option<BlockNumber> {
         self.data_source.creation_block()
+    }
+
+    /// Offchain data sources track done_at which is set once the
+    /// trigger has been processed.
+    fn done_at(&self) -> Option<BlockNumber> {
+        match self.data_source() {
+            DataSource::Onchain(_) => None,
+            DataSource::Offchain(ds) => ds.done_at(),
+        }
+    }
+
+    fn set_done_at(&self, block: Option<BlockNumber>) {
+        match self.data_source() {
+            DataSource::Onchain(_) => {}
+            DataSource::Offchain(ds) => ds.set_done_at(block),
+        }
     }
 }
 

@@ -1,14 +1,14 @@
-use crate::common::helpers::{contains_subslice, postgres_test_database_name, MappedPorts};
 use bollard::image::CreateImageOptions;
 use bollard::models::HostConfig;
 use bollard::{container, Docker};
+use graph_tests::helpers::{contains_subslice, postgres_test_database_name, MappedPorts};
 use std::collections::HashMap;
 use tokio::time::{sleep, Duration};
 use tokio_stream::StreamExt;
 
-const POSTGRES_IMAGE: &'static str = "postgres:latest";
-const IPFS_IMAGE: &'static str = "ipfs/go-ipfs:v0.4.23";
-const GANACHE_IMAGE: &'static str = "trufflesuite/ganache-cli:latest";
+const POSTGRES_IMAGE: &str = "postgres:latest";
+const IPFS_IMAGE: &str = "ipfs/go-ipfs:v0.10.0";
+const GANACHE_IMAGE: &str = "trufflesuite/ganache-cli:latest";
 type DockerError = bollard::errors::Error;
 
 pub async fn pull_images() {
@@ -82,7 +82,11 @@ impl TestContainerService {
 
         container::Config {
             image: Some(POSTGRES_IMAGE),
-            env: Some(vec!["POSTGRES_PASSWORD=password", "POSTGRES_USER=postgres"]),
+            env: Some(vec![
+                "POSTGRES_PASSWORD=password",
+                "POSTGRES_USER=postgres",
+                "POSTGRES_INITDB_ARGS=-E UTF8 --locale=C",
+            ]),
             host_config: Some(host_config),
             cmd: Some(vec![
                 "postgres",
@@ -183,7 +187,7 @@ impl DockerTestClient {
                 unexpected_response
             ),
         };
-        let mapped_ports: MappedPorts = ports.to_vec().into();
+        let mapped_ports: MappedPorts = to_mapped_ports(ports.to_vec());
         Ok(mapped_ports)
     }
 
@@ -209,7 +213,7 @@ impl DockerTestClient {
         loop {
             match stream.next().await {
                 Some(Ok(container::LogOutput::StdOut { message })) => {
-                    if contains_subslice(&message, &trigger_message) {
+                    if contains_subslice(&message, trigger_message) {
                         break;
                     } else {
                         sleep(Duration::from_millis(100)).await;
@@ -240,7 +244,7 @@ impl DockerTestClient {
 
         // 1. Create Exec
         let config = exec::CreateExecOptions {
-            cmd: Some(vec!["createdb", &database_name]),
+            cmd: Some(vec!["createdb", "-E", "UTF8", "--locale=C", &database_name]),
             user: Some("postgres"),
             attach_stdout: Some(true),
             ..Default::default()
@@ -265,23 +269,21 @@ impl DockerTestClient {
     }
 }
 
-impl From<Vec<bollard::models::Port>> for MappedPorts {
-    fn from(input: Vec<bollard::models::Port>) -> Self {
-        let mut hashmap = HashMap::new();
+fn to_mapped_ports(input: Vec<bollard::models::Port>) -> MappedPorts {
+    let mut hashmap = HashMap::new();
 
-        for port in &input {
-            if let bollard::models::Port {
-                private_port,
-                public_port: Some(public_port),
-                ..
-            } = port
-            {
-                hashmap.insert(*private_port as u16, *public_port as u16);
-            }
+    for port in &input {
+        if let bollard::models::Port {
+            private_port,
+            public_port: Some(public_port),
+            ..
+        } = port
+        {
+            hashmap.insert(*private_port as u16, *public_port as u16);
         }
-        if hashmap.is_empty() {
-            panic!("Container exposed no ports. Input={:?}", input)
-        }
-        MappedPorts(hashmap)
     }
+    if hashmap.is_empty() {
+        panic!("Container exposed no ports. Input={:?}", input)
+    }
+    MappedPorts(hashmap)
 }

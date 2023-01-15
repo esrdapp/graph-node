@@ -14,14 +14,11 @@ env:
 jobs:
   unit-tests:
     name: Run unit tests
-    strategy:
-      fail-fast: false
-      matrix:
-        rust: ["stable"]
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     services:
       ipfs:
-        image: ipfs/go-ipfs:v0.4.23
+        image: ipfs/go-ipfs:v0.10.0
         ports:
           - 5001:5001
       postgres:
@@ -29,6 +26,7 @@ jobs:
         env:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: graph_node_test
+          POSTGRES_INITDB_ARGS: "-E UTF8 --locale=C"
         options: >-
           --health-cmd pg_isready
           --health-interval 10s
@@ -36,175 +34,161 @@ jobs:
           --health-retries 5
         ports:
           - 5432:5432
+    env:
+      RUSTFLAGS: "-C link-arg=-fuse-ld=lld -D warnings"
     steps:
       - name: Checkout sources
         uses: actions/checkout@v2
-
-      - name: Cache cargo registry
-        uses: actions/cache@v2
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: test-cargo-${{ hashFiles('**/Cargo.toml') }}
-
-      - name: Install rust toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: ${{ matrix.rust }}
-          override: true
+      - uses: Swatinem/rust-cache@v2
 
       - name: Install lld
-        run: sudo apt-get install -y lld
+        run: sudo apt-get install -y lld protobuf-compiler
 
       - name: Run unit tests
         uses: actions-rs/cargo@v1
-        env:
-          RUSTFLAGS: "-C link-arg=-fuse-ld=lld -D warnings"
         with:
           command: test
           args: --verbose --workspace --exclude graph-tests -- --nocapture
 
-  integration-tests:
-    name: Run integration tests
-    strategy:
-      fail-fast: false
-      matrix:
-        rust: ["stable"]
+  runner-tests:
+    name: Subgraph Runner integration tests
     runs-on: ubuntu-latest
-
+    timeout-minutes: 60
+    services:
+      ipfs:
+        image: ipfs/go-ipfs:v0.10.0
+        ports:
+          - 5001:5001
+      postgres:
+        image: postgres
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: graph_node_test
+          POSTGRES_INITDB_ARGS: "-E UTF8 --locale=C"
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    env:
+      RUSTFLAGS: "-C link-arg=-fuse-ld=lld -D warnings"
     steps:
       - name: Checkout sources
         uses: actions/checkout@v2
+      - uses: Swatinem/rust-cache@v2
 
-      - name: Cache cargo registry
-        uses: actions/cache@v2
+      - name: Install lld
+        run: sudo apt-get install -y lld protobuf-compiler
+
+      - name: Run runner tests
+        id: runner-tests-1
+        uses: actions-rs/cargo@v1
+        env:
+          TESTS_GANACHE_HARD_WAIT_SECONDS: "30"
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: test-cargo-${{ hashFiles('**/Cargo.toml') }}
+          command: test
+          args: --verbose --package graph-tests -- --skip parallel_integration_tests
+
+  integration-tests:
+    name: Run integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      RUSTFLAGS: "-C link-arg=-fuse-ld=lld -D warnings"
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v2
+      - uses: Swatinem/rust-cache@v2
 
       - name: Install Node 14
-        uses: actions/setup-node@v2
+        uses: actions/setup-node@v3
         with:
           node-version: "14"
-
-      - name: Install rust toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: ${{ matrix.rust }}
-          override: true
+          cache: yarn
+          cache-dependency-path: "tests/integration-tests/yarn.lock"
 
       - name: Install lld and jq
-        run: sudo apt-get install -y lld jq
+        run: sudo apt-get install -y lld jq protobuf-compiler
 
       - name: Build graph-node
-        env:
-          RUSTFLAGS: "-C link-arg=-fuse-ld=lld -D warnings"
         uses: actions-rs/cargo@v1
         with:
           command: build
+          args: --bin graph-node
 
       # Integration tests are a bit flaky, running them twice increases the
-      # chances of one run succeeding
+      # chances of one run succeeding.
       - name: Run integration tests (round 1)
         id: integration-tests-1
         uses: actions-rs/cargo@v1
         env:
-          RUSTFLAGS: "-C link-arg=-fuse-ld=lld -D warnings"
-          N_CONCURRENT_TESTS: "1"
+          N_CONCURRENT_TESTS: "4"
           TESTS_GANACHE_HARD_WAIT_SECONDS: "30"
         with:
           command: test
-          args: --verbose --package graph-tests -- --nocapture
+          args: --verbose --package graph-tests parallel_integration_tests -- --nocapture
         continue-on-error: true
       - name: Run integration tests (round 2)
         id: integration-tests-2
         uses: actions-rs/cargo@v1
         if: ${{ steps.integration-tests-1.outcome == 'failure' }}
         env:
-          RUSTFLAGS: "-C link-arg=-fuse-ld=lld -D warnings"
-          N_CONCURRENT_TESTS: "1"
+          N_CONCURRENT_TESTS: "4"
           TESTS_GANACHE_HARD_WAIT_SECONDS: "30"
         with:
           command: test
-          args: --verbose --package graph-tests -- --nocapture
+          args: --verbose --package graph-tests parallel_integration_tests -- --nocapture
 
   rustfmt:
     name: Check rustfmt style
-    strategy:
-      matrix:
-        rust: ["stable"]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      RUSTFLAGS: "-D warnings"
     steps:
       - uses: actions/checkout@v2
-      - uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: ${{ matrix.rust }}
-          components: rustfmt
-          override: true
-      - name: Cache cargo registry
-        uses: actions/cache@v2
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: rustfmt-cargo-${{ hashFiles('**/Cargo.toml') }}
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get -y install libpq-dev
-
-      - name: Check formating
+      - name: Check formatting
         uses: actions-rs/cargo@v1
-        env:
-          RUSTFLAGS: "-D warnings"
         with:
           command: fmt
           args: --all -- --check
 
-  release-check:
-    name: Build in release mode
-    strategy:
-      matrix:
-        rust: ["stable"]
+  clippy:
+    name: Report Clippy warnings
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v2
-      - uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: ${{ matrix.rust }}
-          override: true
-      - name: Cache cargo registry
-        uses: actions/cache@v2
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: check-cargo-${{ hashFiles('**/Cargo.toml') }}
+      # Unlike rustfmt, Clippy actually compiles stuff so it benefits from
+      # caching.
+      - uses: Swatinem/rust-cache@v2
 
+      - name: Run Clippy
+        uses: actions-rs/cargo@v1
+        # We do *not* block builds if Clippy complains. It's just here to let us
+        # keep an eye out on the warnings it produces.
+        continue-on-error: true
+        with:
+          command: clippy
+          args: --no-deps
+
+  release-check:
+    name: Build in release mode
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v2
+      - uses: Swatinem/rust-cache@v2
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get -y install libpq-dev
-
-      - name: Cargo check (debug)
-        uses: actions-rs/cargo@v1
-        env:
-          RUSTFLAGS: "-D warnings"
-        with:
-          command: check
-          args: --tests
-
+          sudo apt-get -y install libpq-dev protobuf-compiler
       - name: Cargo check (release)
-        env:
-          RUSTFLAGS: "-D warnings"
         uses: actions-rs/cargo@v1
         with:
           command: check

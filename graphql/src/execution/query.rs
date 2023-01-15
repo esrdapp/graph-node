@@ -15,7 +15,10 @@ use graph::data::graphql::{ext::TypeExt, ObjectOrInterface};
 use graph::data::query::QueryExecutionError;
 use graph::data::query::{Query as GraphDataQuery, QueryVariables};
 use graph::data::schema::ApiSchema;
-use graph::prelude::{info, o, q, r, s, BlockNumber, CheapClone, Logger, TryFromValue};
+use graph::prelude::{
+    info, o, q, r, s, warn, BlockNumber, CheapClone, DeploymentHash, GraphQLMetrics, Logger,
+    TryFromValue, ENV_VARS,
+};
 
 use crate::execution::ast as a;
 use crate::query::{ast as qast, ext::BlockConstraint};
@@ -24,34 +27,37 @@ use crate::values::coercion;
 use crate::{execution::get_field, schema::api::ErrorPolicy};
 
 lazy_static! {
-    static ref GRAPHQL_VALIDATION_PLAN: ValidationPlan = ValidationPlan::from(
-        if std::env::var("ENABLE_GRAPHQL_VALIDATIONS").ok().is_none() {
+    static ref GRAPHQL_VALIDATION_PLAN: ValidationPlan =
+        ValidationPlan::from(if !ENV_VARS.graphql.enable_validations {
             vec![]
         } else {
             vec![
-                Box::new(UniqueOperationNames {}),
-                Box::new(LoneAnonymousOperation {}),
-                Box::new(SingleFieldSubscriptions {}),
-                Box::new(KnownTypeNames {}),
-                Box::new(FragmentsOnCompositeTypes {}),
-                Box::new(VariablesAreInputTypes {}),
-                Box::new(LeafFieldSelections {}),
-                Box::new(FieldsOnCorrectType {}),
-                Box::new(UniqueFragmentNames {}),
-                Box::new(KnownFragmentNames {}),
-                Box::new(NoUnusedFragments {}),
-                Box::new(OverlappingFieldsCanBeMerged {}),
-                Box::new(NoFragmentsCycle {}),
-                Box::new(PossibleFragmentSpreads {}),
-                Box::new(NoUnusedVariables {}),
-                Box::new(NoUndefinedVariables {}),
-                Box::new(KnownArgumentNames {}),
-                Box::new(UniqueArgumentNames {}),
-                Box::new(UniqueVariableNames {}),
-                Box::new(ProvidedRequiredArguments {}),
+                Box::new(UniqueOperationNames::new()),
+                Box::new(LoneAnonymousOperation::new()),
+                Box::new(SingleFieldSubscriptions::new()),
+                Box::new(KnownTypeNames::new()),
+                Box::new(FragmentsOnCompositeTypes::new()),
+                Box::new(VariablesAreInputTypes::new()),
+                Box::new(LeafFieldSelections::new()),
+                Box::new(FieldsOnCorrectType::new()),
+                Box::new(UniqueFragmentNames::new()),
+                Box::new(KnownFragmentNames::new()),
+                Box::new(NoUnusedFragments::new()),
+                Box::new(OverlappingFieldsCanBeMerged::new()),
+                Box::new(NoFragmentsCycle::new()),
+                Box::new(PossibleFragmentSpreads::new()),
+                Box::new(NoUnusedVariables::new()),
+                Box::new(NoUndefinedVariables::new()),
+                Box::new(KnownArgumentNames::new()),
+                Box::new(UniqueArgumentNames::new()),
+                Box::new(UniqueVariableNames::new()),
+                Box::new(ProvidedRequiredArguments::new()),
+                Box::new(KnownDirectives::new()),
+                Box::new(VariablesInAllowedPosition::new()),
+                Box::new(ValuesOfCorrectType::new()),
+                Box::new(UniqueDirectivesPerLocation::new()),
             ]
-        }
-    );
+        });
 }
 
 #[derive(Clone, Debug)]
@@ -132,6 +138,47 @@ pub struct Query {
     pub query_id: String,
 }
 
+fn validate_query(
+    logger: &Logger,
+    query: &GraphDataQuery,
+    document: &s::Document,
+    metrics: &Arc<dyn GraphQLMetrics>,
+    id: &DeploymentHash,
+) -> Result<(), Vec<QueryExecutionError>> {
+    let validation_errors = validate(document, &query.document, &GRAPHQL_VALIDATION_PLAN);
+
+    if !validation_errors.is_empty() {
+        if !ENV_VARS.graphql.silent_graphql_validations {
+            return Err(validation_errors
+                .into_iter()
+                .map(|e| {
+                    QueryExecutionError::ValidationError(
+                        e.locations.first().cloned(),
+                        e.message.clone(),
+                    )
+                })
+                .collect());
+        } else {
+            warn!(
+              &logger,
+              "GraphQL Validation failure";
+              "query" => &query.query_text,
+              "variables" => &query.variables_text,
+              "errors" => format!("[{:?}]", validation_errors.iter().map(|e| e.message.clone()).collect::<Vec<_>>().join(", "))
+            );
+
+            let error_codes = validation_errors
+                .iter()
+                .map(|e| e.error_code)
+                .collect::<Vec<_>>();
+
+            metrics.observe_query_validation_error(error_codes, id);
+        }
+    }
+
+    Ok(())
+}
+
 impl Query {
     /// Process the raw GraphQL query `query` and prepare for executing it.
     /// The returned `Query` has already been validated and, if `max_complexity`
@@ -144,21 +191,23 @@ impl Query {
         query: GraphDataQuery,
         max_complexity: Option<u64>,
         max_depth: u8,
+        metrics: Arc<dyn GraphQLMetrics>,
     ) -> Result<Arc<Self>, Vec<QueryExecutionError>> {
-        let validation_errors = validate(
-            &schema.document(),
-            &query.document,
-            &GRAPHQL_VALIDATION_PLAN,
-        );
+        let query_hash = {
+            let mut hasher = DefaultHasher::new();
+            query.query_text.hash(&mut hasher);
+            query.variables_text.hash(&mut hasher);
+            hasher.finish()
+        };
+        let query_id = format!("{:x}-{:x}", query.shape_hash, query_hash);
+        let logger = logger.new(o!(
+            "subgraph_id" => schema.id().clone(),
+            "query_id" => query_id.clone()
+        ));
 
-        if validation_errors.len() > 0 {
-            return Err(validation_errors
-                .into_iter()
-                .map(|e| {
-                    QueryExecutionError::ValidationError(e.locations.first().cloned(), e.message)
-                })
-                .collect());
-        }
+        let validation_phase_start = Instant::now();
+        validate_query(&logger, &query, schema.document(), &metrics, schema.id())?;
+        metrics.observe_query_validation(validation_phase_start.elapsed(), schema.id());
 
         let mut operation = None;
         let mut fragments = HashMap::new();
@@ -191,18 +240,6 @@ impl Query {
                 )])
             }
         };
-
-        let query_hash = {
-            let mut hasher = DefaultHasher::new();
-            query.query_text.hash(&mut hasher);
-            query.variables_text.hash(&mut hasher);
-            hasher.finish()
-        };
-        let query_id = format!("{:x}-{:x}", query.shape_hash, query_hash);
-        let logger = logger.new(o!(
-            "subgraph_id" => schema.id().clone(),
-            "query_id" => query_id.clone()
-        ));
 
         let start = Instant::now();
         let root_type = match kind {
@@ -317,7 +354,7 @@ impl Query {
 
     /// Log details about the overall execution of the query
     pub fn log_execution(&self, block: BlockNumber) {
-        if *graph::log::LOG_GQL_TIMING {
+        if ENV_VARS.log_gql_timing() {
             info!(
                 &self.logger,
                 "Query timing (GraphQL)";
@@ -338,7 +375,7 @@ impl Query {
         start: Instant,
         cache_status: String,
     ) {
-        if *graph::log::LOG_GQL_CACHE_TIMING {
+        if ENV_VARS.log_gql_cache_timing() {
             info!(
                 &self.logger,
                 "Query caching";
@@ -402,7 +439,7 @@ pub fn coerce_variables(
         // of the variable definition
         coerced_values.insert(
             variable_def.name.to_owned(),
-            coerce_variable(schema, variable_def, value.into())?,
+            coerce_variable(schema, variable_def, value)?,
         );
     }
 
@@ -532,7 +569,7 @@ impl<'s> RawQuery<'s> {
                     q::Selection::FragmentSpread(fragment) => {
                         let def = self.fragments.get(&fragment.fragment_name).unwrap();
                         let q::TypeCondition::On(type_name) = &def.type_condition;
-                        let ty = self.schema.get_named_type(&type_name).ok_or(Invalid)?;
+                        let ty = self.schema.get_named_type(type_name).ok_or(Invalid)?;
 
                         // Copy `visited_fragments` on write.
                         let mut visited_fragments = visited_fragments.clone();
@@ -540,7 +577,7 @@ impl<'s> RawQuery<'s> {
                             return Err(CyclicalFragment(fragment.fragment_name.clone()));
                         }
                         self.complexity_inner(
-                            &ty,
+                            ty,
                             &def.selection_set,
                             max_depth,
                             depth + 1,
@@ -596,9 +633,8 @@ impl<'s> RawQuery<'s> {
     fn validate_fields(&self) -> Result<(), Vec<QueryExecutionError>> {
         let root_type = self.schema.query_type.as_ref();
 
-        let errors =
-            self.validate_fields_inner(&"Query".to_owned(), root_type.into(), &self.selection_set);
-        if errors.len() == 0 {
+        let errors = self.validate_fields_inner("Query", root_type.into(), &self.selection_set);
+        if errors.is_empty() {
             Ok(())
         } else {
             Err(errors)
@@ -709,10 +745,7 @@ impl Transform {
     // graphql-bug-compat: Once queries are fully validated, all variables
     // will be defined
     fn variable(&self, name: &str) -> r::Value {
-        self.variables
-            .get(name)
-            .map(|value| value.clone())
-            .unwrap_or(r::Value::Null)
+        self.variables.get(name).cloned().unwrap_or(r::Value::Null)
     }
 
     /// Interpolate variable references in the arguments `args`
@@ -752,7 +785,7 @@ impl Transform {
                 let mut rmap = BTreeMap::new();
                 for (key, value) in map.into_iter() {
                     let value = self.interpolate_value(value, pos);
-                    rmap.insert(key, value);
+                    rmap.insert(key.into(), value);
                 }
                 r::Value::object(rmap)
             }
@@ -804,18 +837,18 @@ impl Transform {
         {
             let arg_value = arguments
                 .iter_mut()
-                .find(|arg| &arg.0 == &argument_def.name)
+                .find(|arg| arg.0 == argument_def.name)
                 .map(|arg| &mut arg.1);
             if arg_value.is_some() {
                 defined_args += 1;
             }
             match coercion::coerce_input_value(
                 arg_value.as_deref().cloned(),
-                &argument_def,
+                argument_def,
                 &resolver,
             ) {
                 Ok(Some(value)) => {
-                    let value = if argument_def.name == "text".to_string() {
+                    let value = if argument_def.name == *"text" {
                         r::Value::Object(Object::from_iter(vec![(field_name.to_string(), value)]))
                     } else {
                         value
@@ -901,17 +934,15 @@ impl Transform {
                 return Ok(None);
             }
             a::SelectionSet::new(vec![])
+        } else if is_leaf_type {
+            // see: graphql-bug-compat
+            // Field does not allow selections, ignore selections
+            a::SelectionSet::new(vec![])
         } else {
-            if is_leaf_type {
-                // see: graphql-bug-compat
-                // Field does not allow selections, ignore selections
-                a::SelectionSet::new(vec![])
-            } else {
-                let ty = field_type.field_type.get_base_type();
-                let type_set = a::ObjectTypeSet::from_name(&self.schema, ty)?;
-                let ty = self.schema.object_or_interface(ty).unwrap();
-                self.expand_selection_set(selection_set, &type_set, ty)?
-            }
+            let ty = field_type.field_type.get_base_type();
+            let type_set = a::ObjectTypeSet::from_name(&self.schema, ty)?;
+            let ty = self.schema.object_or_interface(ty).unwrap();
+            self.expand_selection_set(selection_set, &type_set, ty)?
         };
 
         Ok(Some(a::Field {

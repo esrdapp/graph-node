@@ -4,11 +4,14 @@ use std::{collections::HashMap, sync::Arc};
 use futures::future::join_all;
 use graph::blockchain::ChainIdentifier;
 use graph::prelude::{o, MetricsRegistry, NodeId};
+use graph::url::Url;
 use graph::{
     prelude::{info, CheapClone, Logger},
     util::security::SafeDisplay,
 };
-use graph_store_postgres::connection_pool::{ConnectionPool, ForeignServer, PoolName};
+use graph_store_postgres::connection_pool::{
+    ConnectionPool, ForeignServer, PoolCoordinator, PoolName,
+};
 use graph_store_postgres::{
     BlockStore as DieselBlockStore, ChainHeadUpdateListener as PostgresChainHeadUpdateListener,
     NotificationSender, Shard as ShardName, Store as DieselStore, SubgraphStore,
@@ -25,6 +28,7 @@ pub struct StoreBuilder {
     chain_head_update_listener: Arc<PostgresChainHeadUpdateListener>,
     /// Map network names to the shards where they are/should be stored
     chains: HashMap<String, ShardName>,
+    pub coord: Arc<PoolCoordinator>,
 }
 
 impl StoreBuilder {
@@ -35,7 +39,8 @@ impl StoreBuilder {
         logger: &Logger,
         node: &NodeId,
         config: &Config,
-        registry: Arc<impl MetricsRegistry>,
+        fork_base: Option<Url>,
+        registry: Arc<dyn MetricsRegistry>,
     ) -> Self {
         let primary_shard = config.primary_store().clone();
 
@@ -45,8 +50,13 @@ impl StoreBuilder {
             registry.clone(),
         ));
 
-        let (store, pools) =
-            Self::make_subgraph_store_and_pools(logger, node, config, registry.cheap_clone());
+        let (store, pools, coord) = Self::make_subgraph_store_and_pools(
+            logger,
+            node,
+            config,
+            fork_base,
+            registry.cheap_clone(),
+        );
 
         // Try to perform setup (migrations etc.) for all the pools. If this
         // attempt doesn't work for all of them because the database is
@@ -73,6 +83,7 @@ impl StoreBuilder {
             subscription_manager,
             chain_head_update_listener,
             chains,
+            coord,
         }
     }
 
@@ -83,8 +94,13 @@ impl StoreBuilder {
         logger: &Logger,
         node: &NodeId,
         config: &Config,
-        registry: Arc<impl MetricsRegistry>,
-    ) -> (Arc<SubgraphStore>, HashMap<ShardName, ConnectionPool>) {
+        fork_base: Option<Url>,
+        registry: Arc<dyn MetricsRegistry>,
+    ) -> (
+        Arc<SubgraphStore>,
+        HashMap<ShardName, ConnectionPool>,
+        Arc<PoolCoordinator>,
+    ) {
         let notification_sender = Arc::new(NotificationSender::new(registry.cheap_clone()));
 
         let servers = config
@@ -94,6 +110,7 @@ impl StoreBuilder {
             .collect::<Result<Vec<_>, _>>()
             .expect("connection url's contain enough detail");
         let servers = Arc::new(servers);
+        let coord = Arc::new(PoolCoordinator::new(servers));
 
         let shards: Vec<_> = config
             .stores
@@ -106,7 +123,7 @@ impl StoreBuilder {
                     name,
                     shard,
                     registry.cheap_clone(),
-                    servers.clone(),
+                    coord.clone(),
                 );
 
                 let (read_only_conn_pools, weights) = Self::replica_pools(
@@ -115,7 +132,7 @@ impl StoreBuilder {
                     name,
                     shard,
                     registry.cheap_clone(),
-                    servers.clone(),
+                    coord.clone(),
                 );
 
                 let name =
@@ -135,9 +152,11 @@ impl StoreBuilder {
             shards,
             Arc::new(config.deployment.clone()),
             notification_sender,
+            fork_base,
+            registry,
         ));
 
-        (store, pools)
+        (store, pools, coord)
     }
 
     pub fn make_store(
@@ -181,15 +200,15 @@ impl StoreBuilder {
         name: &str,
         shard: &Shard,
         registry: Arc<dyn MetricsRegistry>,
-        servers: Arc<Vec<ForeignServer>>,
+        coord: Arc<PoolCoordinator>,
     ) -> ConnectionPool {
         let logger = logger.new(o!("pool" => "main"));
         let pool_size = shard.pool_size.size_for(node, name).expect(&format!(
-            "we can determine the pool size for store {}",
+            "cannot determine the pool size for store {}",
             name
         ));
         let fdw_pool_size = shard.fdw_pool_size.size_for(node, name).expect(&format!(
-            "we can determine the fdw pool size for store {}",
+            "cannot determine the fdw pool size for store {}",
             name
         ));
         info!(
@@ -199,15 +218,14 @@ impl StoreBuilder {
             "conn_pool_size" => pool_size,
             "weight" => shard.weight
         );
-        ConnectionPool::create(
+        coord.create_pool(
+            &logger,
             name,
             PoolName::Main,
             shard.connection.to_owned(),
             pool_size,
             Some(fdw_pool_size),
-            &logger,
             registry.cheap_clone(),
-            servers,
         )
     }
 
@@ -218,7 +236,7 @@ impl StoreBuilder {
         name: &str,
         shard: &Shard,
         registry: Arc<dyn MetricsRegistry>,
-        servers: Arc<Vec<ForeignServer>>,
+        coord: Arc<PoolCoordinator>,
     ) -> (Vec<ConnectionPool>, Vec<usize>) {
         let mut weights: Vec<_> = vec![shard.weight];
         (
@@ -240,15 +258,15 @@ impl StoreBuilder {
                         "we can determine the pool size for replica {}",
                         name
                     ));
-                    ConnectionPool::create(
+
+                    coord.clone().create_pool(
+                        &logger,
                         name,
                         PoolName::Replica(pool),
                         replica.connection.clone(),
                         pool_size,
                         None,
-                        &logger,
                         registry.cheap_clone(),
-                        servers.clone(),
                     )
                 })
                 .collect(),

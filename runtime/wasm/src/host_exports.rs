@@ -1,28 +1,31 @@
-use crate::{error::DeterminismLevel, module::IntoTrap};
-use graph::blockchain::DataSource;
-use graph::blockchain::{Blockchain, DataSourceTemplate as _};
-use graph::components::store::EntityType;
-use graph::components::store::{EnsLookup, EntityKey};
-use graph::components::subgraph::{CausalityRegion, ProofOfIndexingEvent, SharedProofOfIndexing};
+use std::collections::HashMap;
+use std::ops::Deref;
+use std::str::FromStr;
+use std::time::{Duration, Instant};
+
+use never::Never;
+use semver::Version;
+use wasmtime::Trap;
+use web3::types::H160;
+
+use graph::blockchain::Blockchain;
+use graph::components::store::EnsLookup;
+use graph::components::store::{EntityKey, EntityType};
+use graph::components::subgraph::{
+    PoICausalityRegion, ProofOfIndexingEvent, SharedProofOfIndexing,
+};
 use graph::data::store;
+use graph::data_source::{DataSource, DataSourceTemplate, EntityTypeAccess};
+use graph::ensure;
 use graph::prelude::ethabi::param_type::Reader;
 use graph::prelude::ethabi::{decode, encode, Token};
 use graph::prelude::serde_json;
 use graph::prelude::{slog::b, slog::record_static, *};
 use graph::runtime::gas::{self, complexity, Gas, GasCounter};
 pub use graph::runtime::{DeterministicHostError, HostExportError};
-use never::Never;
-use semver::Version;
-use std::collections::HashMap;
-use std::ops::Deref;
-use std::str::FromStr;
-use std::time::{Duration, Instant};
-use web3::types::H160;
-
-use graph::ensure;
-use wasmtime::Trap;
 
 use crate::module::{WasmInstance, WasmInstanceContext};
+use crate::{error::DeterminismLevel, module::IntoTrap};
 
 fn write_poi_event(
     proof_of_indexing: &SharedProofOfIndexing,
@@ -58,14 +61,16 @@ pub struct HostExports<C: Blockchain> {
     pub api_version: Version,
     data_source_name: String,
     data_source_address: Vec<u8>,
-    data_source_network: String,
+    subgraph_network: String,
     data_source_context: Arc<Option<DataSourceContext>>,
+    entity_type_access: EntityTypeAccess,
+
     /// Some data sources have indeterminism or different notions of time. These
     /// need to be each be stored separately to separate causality between them,
     /// and merge the results later. Right now, this is just the ethereum
     /// networks but will be expanded for ipfs and the availability chain.
     causality_region: String,
-    templates: Arc<Vec<C::DataSourceTemplate>>,
+    templates: Arc<Vec<DataSourceTemplate<C>>>,
     pub(crate) link_resolver: Arc<dyn LinkResolver>,
     ens_lookup: Arc<dyn EnsLookup>,
 }
@@ -73,9 +78,9 @@ pub struct HostExports<C: Blockchain> {
 impl<C: Blockchain> HostExports<C> {
     pub fn new(
         subgraph_id: DeploymentHash,
-        data_source: &impl DataSource<C>,
-        data_source_network: String,
-        templates: Arc<Vec<C::DataSourceTemplate>>,
+        data_source: &DataSource<C>,
+        subgraph_network: String,
+        templates: Arc<Vec<DataSourceTemplate<C>>>,
         link_resolver: Arc<dyn LinkResolver>,
         ens_lookup: Arc<dyn EnsLookup>,
     ) -> Self {
@@ -83,13 +88,29 @@ impl<C: Blockchain> HostExports<C> {
             subgraph_id,
             api_version: data_source.api_version(),
             data_source_name: data_source.name().to_owned(),
-            data_source_address: data_source.address().unwrap_or_default().to_owned(),
+            data_source_address: data_source.address().unwrap_or_default(),
             data_source_context: data_source.context().cheap_clone(),
-            causality_region: CausalityRegion::from_network(&data_source_network),
-            data_source_network,
+            entity_type_access: data_source.entities(),
+            causality_region: PoICausalityRegion::from_network(&subgraph_network),
+            subgraph_network,
             templates,
             link_resolver,
             ens_lookup,
+        }
+    }
+
+    /// Enfore the entity type access restrictions. See also: entity-type-access
+    fn check_entity_type_access(&self, entity_type: &EntityType) -> Result<(), HostExportError> {
+        match self.entity_type_access.allows(entity_type) {
+            true => Ok(()),
+            false => Err(HostExportError::Deterministic(anyhow!(
+                "entity type `{}` is not on the 'entities' list for data source `{}`. \
+                 Hint: Add `{}` to the 'entities' list, which currently is: `{}`.",
+                entity_type,
+                self.data_source_name,
+                entity_type,
+                self.entity_type_access
+            ))),
         }
     }
 
@@ -132,10 +153,10 @@ impl<C: Blockchain> HostExports<C> {
         proof_of_indexing: &SharedProofOfIndexing,
         entity_type: String,
         entity_id: String,
-        mut data: HashMap<String, Value>,
+        data: HashMap<String, Value>,
         stopwatch: &StopwatchMetrics,
         gas: &GasCounter,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), HostExportError> {
         let poi_section = stopwatch.start_section("host_export_store_set__proof_of_indexing");
         write_poi_event(
             proof_of_indexing,
@@ -149,34 +170,16 @@ impl<C: Blockchain> HostExports<C> {
         );
         poi_section.end();
 
-        let id_insert_section = stopwatch.start_section("host_export_store_set__insert_id");
-        // Automatically add an "id" value
-        match data.insert("id".to_string(), Value::String(entity_id.clone())) {
-            Some(ref v) if v != &Value::String(entity_id.clone()) => {
-                return Err(anyhow!(
-                    "Value of {} attribute 'id' conflicts with ID passed to `store.set()`: \
-                     {} != {}",
-                    entity_type,
-                    v,
-                    entity_id,
-                ));
-            }
-            _ => (),
-        }
-
-        id_insert_section.end();
-        let validation_section = stopwatch.start_section("host_export_store_set");
         let key = EntityKey {
-            subgraph_id: self.subgraph_id.clone(),
             entity_type: EntityType::new(entity_type),
-            entity_id,
+            entity_id: entity_id.into(),
         };
+        self.check_entity_type_access(&key.entity_type)?;
 
         gas.consume_host_fn(gas::STORE_SET.with_args(complexity::Linear, (&key, &data)))?;
 
         let entity = Entity::from(data);
         state.entity_cache.set(key.clone(), entity)?;
-        validation_section.end();
 
         Ok(())
     }
@@ -200,10 +203,10 @@ impl<C: Blockchain> HostExports<C> {
             logger,
         );
         let key = EntityKey {
-            subgraph_id: self.subgraph_id.clone(),
             entity_type: EntityType::new(entity_type),
-            entity_id,
+            entity_id: entity_id.into(),
         };
+        self.check_entity_type_access(&key.entity_type)?;
 
         gas.consume_host_fn(gas::STORE_REMOVE.with_args(complexity::Size, &key))?;
 
@@ -220,15 +223,15 @@ impl<C: Blockchain> HostExports<C> {
         gas: &GasCounter,
     ) -> Result<Option<Entity>, anyhow::Error> {
         let store_key = EntityKey {
-            subgraph_id: self.subgraph_id.clone(),
-            entity_type: EntityType::new(entity_type.clone()),
-            entity_id: entity_id.clone(),
+            entity_type: EntityType::new(entity_type),
+            entity_id: entity_id.into(),
         };
+        self.check_entity_type_access(&store_key.entity_type)?;
 
         let result = state.entity_cache.get(&store_key)?;
         gas.consume_host_fn(gas::STORE_GET.with_args(complexity::Linear, (&store_key, &result)))?;
 
-        Ok(state.entity_cache.get(&store_key)?)
+        Ok(result)
     }
 
     /// Prints the module of `n` in hex.
@@ -258,7 +261,18 @@ impl<C: Blockchain> HostExports<C> {
         // Does not consume gas because this is not a part of the deterministic feature set.
         // Ideally this would first consume gas for fetching the file stats, and then again
         // for the bytes of the file.
-        block_on03(self.link_resolver.cat(logger, &Link { link }))
+        graph::block_on(self.link_resolver.cat(logger, &Link { link }))
+    }
+
+    pub(crate) fn ipfs_get_block(
+        &self,
+        logger: &Logger,
+        link: String,
+    ) -> Result<Vec<u8>, anyhow::Error> {
+        // Does not consume gas because this is not a part of the deterministic feature set.
+        // Ideally this would first consume gas for fetching the file stats, and then again
+        // for the bytes of the file.
+        graph::block_on(self.link_resolver.get_block(logger, &Link { link }))
     }
 
     // Read the IPFS file `link`, split it into JSON objects, and invoke the
@@ -302,9 +316,9 @@ impl<C: Blockchain> HostExports<C> {
 
         let result = {
             let mut stream: JsonValueStream =
-                block_on03(link_resolver.json_stream(&logger, &Link { link }))?;
+                graph::block_on(link_resolver.json_stream(&logger, &Link { link }))?;
             let mut v = Vec::new();
-            while let Some(sv) = block_on03(stream.next()) {
+            while let Some(sv) = graph::block_on(stream.next()) {
                 let sv = sv?;
                 let module = WasmInstance::from_valid_module_with_ctx(
                     valid_module.clone(),
@@ -462,7 +476,10 @@ impl<C: Blockchain> HostExports<C> {
         exp: u8,
         gas: &GasCounter,
     ) -> Result<BigInt, DeterministicHostError> {
-        gas.consume_host_fn(gas::BIG_MATH_GAS_OP.with_args(complexity::Exponential, (&x, exp)))?;
+        gas.consume_host_fn(
+            gas::BIG_MATH_GAS_OP
+                .with_args(complexity::Exponential, (&x, (exp as f32).log2() as u8)),
+        )?;
         Ok(x.pow(exp))
     }
 
@@ -636,7 +653,7 @@ impl<C: Blockchain> HostExports<C> {
                     self.data_source_name,
                     self.templates
                         .iter()
-                        .map(|template| template.name().clone())
+                        .map(|template| template.name())
                         .collect::<Vec<_>>()
                         .join(", ")
                 )
@@ -657,6 +674,10 @@ impl<C: Blockchain> HostExports<C> {
 
     pub(crate) fn ens_name_by_hash(&self, hash: &str) -> Result<Option<String>, anyhow::Error> {
         Ok(self.ens_lookup.find_name(hash)?)
+    }
+
+    pub(crate) fn is_ens_data_empty(&self) -> Result<bool, anyhow::Error> {
+        Ok(self.ens_lookup.is_table_empty()?)
     }
 
     pub(crate) fn log_log(
@@ -697,7 +718,7 @@ impl<C: Blockchain> HostExports<C> {
         gas: &GasCounter,
     ) -> Result<String, DeterministicHostError> {
         gas.consume_host_fn(Gas::new(gas::DEFAULT_BASE_COST))?;
-        Ok(self.data_source_network.clone())
+        Ok(self.subgraph_network.clone())
     }
 
     pub(crate) fn data_source_context(
@@ -762,8 +783,8 @@ impl<C: Blockchain> HostExports<C> {
     ) -> Result<Token, anyhow::Error> {
         gas.consume_host_fn(gas::DEFAULT_GAS_OP.with_args(complexity::Size, &data))?;
 
-        let param_types = Reader::read(&types)
-            .or_else(|e| Err(anyhow::anyhow!("Failed to read types: {}", e)))?;
+        let param_types =
+            Reader::read(&types).map_err(|e| anyhow::anyhow!("Failed to read types: {}", e))?;
 
         decode(&[param_types], &data)
             // The `.pop().unwrap()` here is ok because we're always only passing one
@@ -772,10 +793,6 @@ impl<C: Blockchain> HostExports<C> {
             .map(|mut tokens| tokens.pop().unwrap())
             .context("Failed to decode")
     }
-}
-
-fn block_on03<T>(future: impl futures03::Future<Output = T> + Send) -> T {
-    graph::block_on(future)
 }
 
 fn string_to_h160(string: &str) -> Result<H160, DeterministicHostError> {
@@ -819,7 +836,7 @@ fn bytes_to_string_is_lossy() {
         "Downcoin WETH-USDT",
         bytes_to_string(
             &graph::log::logger(true),
-            vec![68, 111, 119, 110, 99, 111, 105, 110, 32, 87, 69, 84, 72, 45, 85, 83, 68, 84]
+            vec![68, 111, 119, 110, 99, 111, 105, 110, 32, 87, 69, 84, 72, 45, 85, 83, 68, 84],
         )
     );
 
@@ -830,7 +847,7 @@ fn bytes_to_string_is_lossy() {
             vec![
                 68, 111, 119, 110, 99, 111, 105, 110, 32, 87, 69, 84, 72, 45, 85, 83, 68, 84, 160,
                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
-            ]
+            ],
         )
     )
 }

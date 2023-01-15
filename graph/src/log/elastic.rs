@@ -27,6 +27,8 @@ pub struct ElasticLoggingConfig {
     pub username: Option<String>,
     /// The Elasticsearch password (optional).
     pub password: Option<String>,
+    /// A client to serve as a connection pool to the endpoint.
+    pub client: Client,
 }
 
 /// Serializes an slog log level using a serde Serializer.
@@ -90,7 +92,8 @@ impl HashMapKVSerializer {
 
 impl Serializer for HashMapKVSerializer {
     fn emit_arguments(&mut self, key: Key, val: &fmt::Arguments) -> slog::Result {
-        Ok(self.kvs.push((key.into(), format!("{}", val))))
+        self.kvs.push((key.into(), format!("{}", val)));
+        Ok(())
     }
 }
 
@@ -123,7 +126,8 @@ impl SimpleKVSerializer {
 
 impl Serializer for SimpleKVSerializer {
     fn emit_arguments(&mut self, key: Key, val: &fmt::Arguments) -> slog::Result {
-        Ok(self.kvs.push((key.into(), format!("{}", val))))
+        self.kvs.push((key.into(), format!("{}", val)));
+        Ok(())
     }
 }
 
@@ -265,14 +269,16 @@ impl ElasticDrain {
                 batch_url.set_path("_bulk");
 
                 // Send batch of logs to Elasticsearch
-                let client = Client::new();
-
                 let header = match config.general.username {
-                    Some(username) => client
+                    Some(username) => config
+                        .general
+                        .client
                         .post(batch_url)
                         .header(CONTENT_TYPE, "application/json")
                         .basic_auth(username, config.general.password.clone()),
-                    None => client
+                    None => config
+                        .general
+                        .client
                         .post(batch_url)
                         .header(CONTENT_TYPE, "application/json"),
                 };
@@ -352,7 +358,7 @@ impl Drain for ElasticDrain {
         // Prepare log document
         let log = ElasticLog {
             id,
-            custom_id: custom_id,
+            custom_id,
             arguments,
             timestamp,
             text,

@@ -1,4 +1,7 @@
+use graph::blockchain::block_stream::FirehoseCursor;
 use graph::data::graphql::ext::TypeDefinitionExt;
+use graph::data::query::QueryTarget;
+use graph::data::subgraph::schema::DeploymentCreate;
 use graph_chain_ethereum::{Mapping, MappingABI};
 use graph_mock::MockMetricsRegistry;
 use hex_literal::hex;
@@ -8,14 +11,14 @@ use std::{collections::HashSet, sync::Mutex};
 use std::{marker::PhantomData, str::FromStr};
 use test_store::*;
 
-use graph::components::store::{DeploymentLocator, WritableStore};
+use graph::components::store::{DeploymentLocator, EntityKey, WritableStore};
 use graph::data::subgraph::*;
 use graph::prelude::*;
 use graph::{
     blockchain::DataSource,
     components::store::{
-        BlockStore as _, EntityFilter, EntityKey, EntityOrder, EntityQuery, EntityType,
-        StatusStore, SubscriptionManager as _,
+        BlockStore as _, EntityFilter, EntityOrder, EntityQuery, EntityType, StatusStore,
+        SubscriptionManager as _,
     },
     prelude::ethabi::Contract,
 };
@@ -134,15 +137,17 @@ where
         remove_test_data(subgraph_store.clone());
 
         // Seed database with test data
-        let deployment = insert_test_data(subgraph_store.clone());
+        let deployment = insert_test_data(subgraph_store.clone()).await;
         let writable = store
             .subgraph_store()
             .writable(LOGGER.clone(), deployment.id)
             .await
             .expect("we can get a writable store");
 
-        // Run test
-        test(store, writable, deployment).await
+        // Run test and wait for the background writer to finish its work so
+        // it won't conflict with the next test
+        test(store, writable.clone(), deployment).await;
+        writable.flush().await.unwrap();
     });
 }
 
@@ -150,7 +155,7 @@ where
 ///
 /// Inserts data in test blocks `GENESIS_PTR`, `TEST_BLOCK_1_PTR`, and
 /// `TEST_BLOCK_2_PTR`
-fn insert_test_data(store: Arc<DieselSubgraphStore>) -> DeploymentLocator {
+async fn insert_test_data(store: Arc<DieselSubgraphStore>) -> DeploymentLocator {
     let manifest = SubgraphManifest::<graph_chain_ethereum::Chain> {
         id: TEST_SUBGRAPH_ID.clone(),
         spec_version: Version::new(1, 0, 0),
@@ -165,7 +170,7 @@ fn insert_test_data(store: Arc<DieselSubgraphStore>) -> DeploymentLocator {
     };
 
     // Create SubgraphDeploymentEntity
-    let deployment = SubgraphDeploymentEntity::new(&manifest, false, None);
+    let deployment = DeploymentCreate::new(String::new(), &manifest, None);
     let name = SubgraphName::new("test/store").unwrap();
     let node_id = NodeId::new("test").unwrap();
     let deployment = store
@@ -195,6 +200,7 @@ fn insert_test_data(store: Arc<DieselSubgraphStore>) -> DeploymentLocator {
         GENESIS_PTR.clone(),
         vec![test_entity_1],
     )
+    .await
     .unwrap();
 
     let test_entity_2 = create_test_entity(
@@ -223,6 +229,7 @@ fn insert_test_data(store: Arc<DieselSubgraphStore>) -> DeploymentLocator {
         TEST_BLOCK_1_PTR.clone(),
         vec![test_entity_2, test_entity_3_1],
     )
+    .await
     .unwrap();
 
     let test_entity_3_2 = create_test_entity(
@@ -235,12 +242,13 @@ fn insert_test_data(store: Arc<DieselSubgraphStore>) -> DeploymentLocator {
         false,
         None,
     );
-    transact_entity_operations(
+    transact_and_wait(
         &store,
         &deployment,
         TEST_BLOCK_2_PTR.clone(),
         vec![test_entity_3_2],
     )
+    .await
     .unwrap();
 
     deployment
@@ -279,11 +287,7 @@ fn create_test_entity(
     );
 
     EntityOperation::Set {
-        key: EntityKey::data(
-            TEST_SUBGRAPH_ID.clone(),
-            entity_type.to_owned(),
-            id.to_owned(),
-        ),
+        key: EntityKey::data(entity_type.to_owned(), id.to_owned()),
         data: test_entity,
     }
 }
@@ -306,13 +310,13 @@ fn get_entity_count(store: Arc<DieselStore>, subgraph_id: &DeploymentHash) -> u6
 #[test]
 fn delete_entity() {
     run_test(|store, writable, deployment| async move {
-        let entity_key = EntityKey::data(deployment.hash.clone(), USER.to_owned(), "3".to_owned());
+        let entity_key = EntityKey::data(USER.to_owned(), "3".to_owned());
 
         // Check that there is an entity to remove.
         writable.get(&entity_key).unwrap().unwrap();
 
         let count = get_entity_count(store.clone(), &&deployment.hash);
-        transact_entity_operations(
+        transact_and_wait(
             &store.subgraph_store(),
             &deployment,
             TEST_BLOCK_3_PTR.clone(),
@@ -320,6 +324,7 @@ fn delete_entity() {
                 key: entity_key.clone(),
             }],
         )
+        .await
         .unwrap();
         assert_eq!(
             count,
@@ -334,13 +339,12 @@ fn delete_entity() {
 /// Check that user 1 was inserted correctly
 #[test]
 fn get_entity_1() {
-    run_test(|_, writable, deployment| async move {
-        let key = EntityKey::data(deployment.hash.clone(), USER.to_owned(), "1".to_owned());
+    run_test(|_, writable, _| async move {
+        let key = EntityKey::data(USER.to_owned(), "1".to_owned());
         let result = writable.get(&key).unwrap();
 
         let mut expected_entity = Entity::new();
 
-        expected_entity.insert("__typename".to_owned(), USER.into());
         expected_entity.insert("id".to_owned(), "1".into());
         expected_entity.insert("name".to_owned(), "Johnton".into());
         expected_entity.insert(
@@ -365,13 +369,12 @@ fn get_entity_1() {
 /// Check that user 3 was updated correctly
 #[test]
 fn get_entity_3() {
-    run_test(|_, writable, deployment| async move {
-        let key = EntityKey::data(deployment.hash.clone(), USER.to_owned(), "3".to_owned());
+    run_test(|_, writable, _| async move {
+        let key = EntityKey::data(USER.to_owned(), "3".to_owned());
         let result = writable.get(&key).unwrap();
 
         let mut expected_entity = Entity::new();
 
-        expected_entity.insert("__typename".to_owned(), USER.into());
         expected_entity.insert("id".to_owned(), "3".into());
         expected_entity.insert("name".to_owned(), "Shaqueeena".into());
         expected_entity.insert(
@@ -396,7 +399,7 @@ fn get_entity_3() {
 #[test]
 fn insert_entity() {
     run_test(|store, writable, deployment| async move {
-        let entity_key = EntityKey::data(deployment.hash.clone(), USER.to_owned(), "7".to_owned());
+        let entity_key = EntityKey::data(USER.to_owned(), "7".to_owned());
         let test_entity = create_test_entity(
             "7",
             USER,
@@ -408,12 +411,13 @@ fn insert_entity() {
             Some("green"),
         );
         let count = get_entity_count(store.clone(), &&deployment.hash);
-        transact_entity_operations(
+        transact_and_wait(
             &store.subgraph_store(),
             &deployment,
             TEST_BLOCK_3_PTR.clone(),
             vec![test_entity],
         )
+        .await
         .unwrap();
         assert_eq!(count + 1, get_entity_count(store.clone(), &deployment.hash));
 
@@ -425,7 +429,7 @@ fn insert_entity() {
 #[test]
 fn update_existing() {
     run_test(|store, writable, deployment| async move {
-        let entity_key = EntityKey::data(deployment.hash.clone(), USER.to_owned(), "1".to_owned());
+        let entity_key = EntityKey::data(USER.to_owned(), "1".to_owned());
 
         let op = create_test_entity(
             "1",
@@ -453,6 +457,7 @@ fn update_existing() {
             TEST_BLOCK_3_PTR.clone(),
             vec![op],
         )
+        .await
         .unwrap();
         assert_eq!(count, get_entity_count(store.clone(), &deployment.hash));
 
@@ -462,7 +467,6 @@ fn update_existing() {
             _ => unreachable!(),
         };
 
-        new_data.insert("__typename".to_owned(), USER.into());
         new_data.insert("bin_name".to_owned(), Value::Bytes(bin_name));
         assert_eq!(writable.get(&entity_key).unwrap(), Some(new_data));
     })
@@ -471,7 +475,7 @@ fn update_existing() {
 #[test]
 fn partially_update_existing() {
     run_test(|store, writable, deployment| async move {
-        let entity_key = EntityKey::data(deployment.hash.clone(), USER.to_owned(), "1".to_owned());
+        let entity_key = EntityKey::data(USER.to_owned(), "1".to_owned());
 
         let partial_entity = Entity::from(vec![
             ("id", Value::from("1")),
@@ -494,6 +498,7 @@ fn partially_update_existing() {
                 data: partial_entity.clone(),
             }],
         )
+        .await
         .unwrap();
 
         // Obtain the updated entity from the store
@@ -1047,15 +1052,16 @@ fn revert_block_with_delete() {
             .desc("name");
 
         // Delete entity with id=2
-        let del_key = EntityKey::data(deployment.hash.clone(), USER.to_owned(), "2".to_owned());
+        let del_key = EntityKey::data(USER.to_owned(), "2".to_owned());
 
         // Process deletion
-        transact_entity_operations(
+        transact_and_wait(
             &store.subgraph_store(),
             &deployment,
             TEST_BLOCK_3_PTR.clone(),
             vec![EntityOperation::Remove { key: del_key }],
         )
+        .await
         .unwrap();
 
         let subscription = subscribe(&deployment.hash, USER);
@@ -1091,7 +1097,7 @@ fn revert_block_with_delete() {
 #[test]
 fn revert_block_with_partial_update() {
     run_test(|store, writable, deployment| async move {
-        let entity_key = EntityKey::data(deployment.hash.clone(), USER.to_owned(), "1".to_owned());
+        let entity_key = EntityKey::data(USER.to_owned(), "1".to_owned());
 
         let partial_entity = Entity::from(vec![
             ("id", Value::from("1")),
@@ -1111,6 +1117,7 @@ fn revert_block_with_partial_update() {
                 data: partial_entity.clone(),
             }],
         )
+        .await
         .unwrap();
 
         let subscription = subscribe(&deployment.hash, USER);
@@ -1137,12 +1144,10 @@ fn mock_data_source() -> graph_chain_ethereum::DataSource {
     graph_chain_ethereum::DataSource {
         kind: String::from("ethereum/contract"),
         name: String::from("example data source"),
+        manifest_idx: 0,
         network: Some(String::from("mainnet")),
-        source: Source {
-            address: Some(Address::from_str("0123123123012312312301231231230123123123").unwrap()),
-            abi: String::from("123123"),
-            start_block: 0,
-        },
+        address: Some(Address::from_str("0123123123012312312301231231230123123123").unwrap()),
+        start_block: 0,
         mapping: Mapping {
             kind: String::from("ethereum/events"),
             api_version: Version::parse("0.1.0").unwrap(),
@@ -1190,7 +1195,7 @@ fn revert_block_with_dynamic_data_source_operations() {
         let subgraph_store = store.subgraph_store();
 
         // Create operations to add a user
-        let user_key = EntityKey::data(deployment.hash.clone(), USER.to_owned(), "1".to_owned());
+        let user_key = EntityKey::data(USER.to_owned(), "1".to_owned());
         let partial_entity = Entity::from(vec![
             ("id", Value::from("1")),
             ("name", Value::from("Johnny Boy")),
@@ -1201,7 +1206,8 @@ fn revert_block_with_dynamic_data_source_operations() {
         let original_user = writable.get(&user_key).unwrap().expect("missing entity");
 
         // Create operations to add a dynamic data source
-        let data_source = mock_data_source();
+        let mut data_source = mock_data_source();
+        let manifest_idx_and_name = vec![(0, "example data source".to_string())];
 
         let ops = vec![EntityOperation::Set {
             key: user_key.clone(),
@@ -1209,13 +1215,16 @@ fn revert_block_with_dynamic_data_source_operations() {
         }];
 
         // Add user and dynamic data source to the store
+        data_source.creation_block = Some(TEST_BLOCK_3_PTR.number);
         transact_entities_and_dynamic_data_sources(
             &subgraph_store,
             deployment.clone(),
             TEST_BLOCK_3_PTR.clone(),
             vec![data_source.as_stored_dynamic_data_source()],
             ops,
+            manifest_idx_and_name.clone(),
         )
+        .await
         .unwrap();
 
         // Verify that the user is no longer the original
@@ -1225,9 +1234,15 @@ fn revert_block_with_dynamic_data_source_operations() {
         );
 
         // Verify that the dynamic data source exists afterwards
-        let loaded_dds = writable.load_dynamic_data_sources().await.unwrap();
+        let loaded_dds = writable
+            .load_dynamic_data_sources(manifest_idx_and_name.clone())
+            .await
+            .unwrap();
         assert_eq!(1, loaded_dds.len());
-        assert_eq!(data_source.source, loaded_dds[0].source);
+        assert_eq!(
+            data_source.address.unwrap().0,
+            **loaded_dds[0].param.as_ref().unwrap()
+        );
 
         let subscription = subscribe(&deployment.hash, USER);
 
@@ -1241,7 +1256,10 @@ fn revert_block_with_dynamic_data_source_operations() {
         );
 
         // Verify that the dynamic data source is gone after the reversion
-        let loaded_dds = writable.load_dynamic_data_sources().await.unwrap();
+        let loaded_dds = writable
+            .load_dynamic_data_sources(manifest_idx_and_name)
+            .await
+            .unwrap();
         assert_eq!(0, loaded_dds.len());
 
         // Verify that the right change events were emitted for the reversion
@@ -1278,9 +1296,8 @@ fn entity_changes_are_fired_and_forwarded_to_subscriptions() {
             chain: PhantomData,
         };
 
-        // Create SubgraphDeploymentEntity
-        let deployment_entity =
-            SubgraphDeploymentEntity::new(&manifest, false, Some(TEST_BLOCK_0_PTR.clone()));
+        let deployment =
+            DeploymentCreate::new(String::new(), &manifest, Some(TEST_BLOCK_0_PTR.clone()));
         let name = SubgraphName::new("test/entity-changes-are-fired").unwrap();
         let node_id = NodeId::new("test").unwrap();
         let deployment = store
@@ -1288,7 +1305,7 @@ fn entity_changes_are_fired_and_forwarded_to_subscriptions() {
             .create_subgraph_deployment(
                 name,
                 &schema,
-                deployment_entity,
+                deployment,
                 node_id,
                 NETWORK_NAME.to_string(),
                 SubgraphVersionSwitchingMode::Instant,
@@ -1321,11 +1338,12 @@ fn entity_changes_are_fired_and_forwarded_to_subscriptions() {
             added_entities
                 .iter()
                 .map(|(id, data)| EntityOperation::Set {
-                    key: EntityKey::data(subgraph_id.clone(), USER.to_owned(), id.to_owned()),
+                    key: EntityKey::data(USER.to_owned(), id.to_owned()),
                     data: data.to_owned(),
                 })
                 .collect(),
         )
+        .await
         .unwrap();
 
         // Update an entity in the store
@@ -1334,13 +1352,13 @@ fn entity_changes_are_fired_and_forwarded_to_subscriptions() {
             ("name", Value::from("Johnny")),
         ]);
         let update_op = EntityOperation::Set {
-            key: EntityKey::data(subgraph_id.clone(), USER.to_owned(), "1".to_owned()),
+            key: EntityKey::data(USER.to_owned(), "1".to_owned()),
             data: updated_entity.clone(),
         };
 
         // Delete an entity in the store
         let delete_op = EntityOperation::Remove {
-            key: EntityKey::data(subgraph_id.clone(), USER.to_owned(), "2".to_owned()),
+            key: EntityKey::data(USER.to_owned(), "2".to_owned()),
         };
 
         // Commit update & delete ops
@@ -1350,6 +1368,7 @@ fn entity_changes_are_fired_and_forwarded_to_subscriptions() {
             TEST_BLOCK_2_PTR.clone(),
             vec![update_op, delete_op],
         )
+        .await
         .unwrap();
 
         // We're expecting two events to be written to the subscription stream
@@ -1389,7 +1408,10 @@ fn throttle_subscription_delivers() {
                 &*LOGGER,
                 store
                     .clone()
-                    .query_store(deployment.hash.clone().into(), true)
+                    .query_store(
+                        QueryTarget::Deployment(deployment.hash.clone().into(), Default::default()),
+                        true,
+                    )
                     .await
                     .unwrap(),
                 Duration::from_millis(500),
@@ -1413,6 +1435,7 @@ fn throttle_subscription_delivers() {
             TEST_BLOCK_3_PTR.clone(),
             vec![user4],
         )
+        .await
         .unwrap();
 
         let expected = StoreEvent::new(vec![make_entity_change(USER)]);
@@ -1430,7 +1453,10 @@ fn throttle_subscription_throttles() {
                 &*LOGGER,
                 store
                     .clone()
-                    .query_store(deployment.hash.clone().into(), true)
+                    .query_store(
+                        QueryTarget::Deployment(deployment.hash.clone(), Default::default()),
+                        true,
+                    )
                     .await
                     .unwrap(),
                 Duration::from_secs(30),
@@ -1454,6 +1480,7 @@ fn throttle_subscription_throttles() {
             TEST_BLOCK_3_PTR.clone(),
             vec![user4],
         )
+        .await
         .unwrap();
 
         // Make sure we time out waiting for the subscription
@@ -1472,7 +1499,7 @@ fn subgraph_schema_types_have_subgraph_id_directive() {
     run_test(|store, _, deployment| async move {
         let schema = store
             .subgraph_store()
-            .api_schema(&deployment.hash)
+            .api_schema(&deployment.hash, &Default::default())
             .expect("test subgraph should have a schema");
         for typedef in schema
             .definitions()
@@ -1518,7 +1545,7 @@ fn handle_large_string_with_index() {
         data.set("id", id);
         data.set(NAME, name);
 
-        let key = EntityKey::data(TEST_SUBGRAPH_ID.clone(), USER.to_owned(), id.to_owned());
+        let key = EntityKey::data(USER.to_owned(), id.to_owned());
 
         EntityModification::Insert { key, data }
     }
@@ -1537,22 +1564,27 @@ fn handle_large_string_with_index() {
         let stopwatch_metrics = StopwatchMetrics::new(
             Logger::root(slog::Discard, o!()),
             deployment.hash.clone(),
+            "test",
             metrics_registry.clone(),
         );
 
         writable
             .transact_block_operations(
                 TEST_BLOCK_3_PTR.clone(),
-                None,
+                FirehoseCursor::None,
                 vec![
                     make_insert_op(ONE, &long_text),
                     make_insert_op(TWO, &other_text),
                 ],
-                stopwatch_metrics,
+                &stopwatch_metrics,
+                Vec::new(),
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
             )
+            .await
             .expect("Failed to insert large text");
+        writable.flush().await.unwrap();
 
         let query = user_query()
             .first(5)
@@ -1576,6 +1608,104 @@ fn handle_large_string_with_index() {
         // Make sure we check the full string and not just a prefix
         let mut prefix = long_text.clone();
         prefix.truncate(STRING_PREFIX_SIZE);
+        let query = user_query()
+            .first(5)
+            .filter(EntityFilter::LessOrEqual(NAME.to_owned(), prefix.into()))
+            .asc(NAME);
+
+        let ids = store
+            .subgraph_store()
+            .find(query)
+            .expect("Could not find entity")
+            .iter()
+            .map(|e| e.id())
+            .collect::<Result<Vec<_>, _>>()
+            .expect("Found entities without an id");
+
+        // Users with name 'Cindini' and 'Johnton'
+        assert_eq!(vec!["2", "1"], ids);
+    })
+}
+
+#[test]
+fn handle_large_bytea_with_index() {
+    const NAME: &str = "bin_name";
+    const ONE: &str = "large_string_one";
+    const TWO: &str = "large_string_two";
+
+    fn make_insert_op(id: &str, name: &[u8]) -> EntityModification {
+        let mut data = Entity::new();
+        data.set("id", id);
+        data.set(NAME, scalar::Bytes::from(name));
+
+        let key = EntityKey::data(USER.to_owned(), id.to_owned());
+
+        EntityModification::Insert { key, data }
+    }
+
+    run_test(|store, writable, deployment| async move {
+        // We have to produce a massive bytea (240_000 bytes) because the
+        // repeated text compresses so well. This leads to an error 'index
+        // row size 2784 exceeds btree version 4 maximum 2704' if used with
+        // a btree index without size limitation
+        let long_bytea = std::iter::repeat("Quo usque tandem")
+            .take(15000)
+            .collect::<String>()
+            .into_bytes();
+        let other_bytea = {
+            let mut other_bytea = long_bytea.clone();
+            other_bytea.push(b'X');
+            scalar::Bytes::from(other_bytea.as_slice())
+        };
+        let long_bytea = scalar::Bytes::from(long_bytea.as_slice());
+
+        let metrics_registry = Arc::new(MockMetricsRegistry::new());
+        let stopwatch_metrics = StopwatchMetrics::new(
+            Logger::root(slog::Discard, o!()),
+            deployment.hash.clone(),
+            "test",
+            metrics_registry.clone(),
+        );
+
+        writable
+            .transact_block_operations(
+                TEST_BLOCK_3_PTR.clone(),
+                FirehoseCursor::None,
+                vec![
+                    make_insert_op(ONE, &long_bytea),
+                    make_insert_op(TWO, &other_bytea),
+                ],
+                &stopwatch_metrics,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .expect("Failed to insert large text");
+        writable.flush().await.unwrap();
+
+        let query = user_query()
+            .first(5)
+            .filter(EntityFilter::Equal(
+                NAME.to_owned(),
+                long_bytea.clone().into(),
+            ))
+            .asc(NAME);
+
+        let ids = store
+            .subgraph_store()
+            .find(query)
+            .expect("Could not find entity")
+            .iter()
+            .map(|e| e.id())
+            .collect::<Result<Vec<_>, _>>()
+            .expect("Found entities without an id");
+
+        assert_eq!(vec![ONE], ids);
+
+        // Make sure we check the full string and not just a prefix
+        let prefix = scalar::Bytes::from(&long_bytea.as_slice()[..64]);
         let query = user_query()
             .first(5)
             .filter(EntityFilter::LessOrEqual(NAME.to_owned(), prefix.into()))
@@ -1713,11 +1843,7 @@ fn window() {
         entity.set("age", age);
         entity.set("favorite_color", color);
         EntityOperation::Set {
-            key: EntityKey::data(
-                TEST_SUBGRAPH_ID.clone(),
-                entity_type.to_owned(),
-                id.to_owned(),
-            ),
+            key: EntityKey::data(entity_type.to_owned(), id.to_owned()),
             data: entity,
         }
     }
@@ -1744,12 +1870,13 @@ fn window() {
     ];
 
     run_test(|store, _, deployment| async move {
-        transact_entity_operations(
+        transact_and_wait(
             &store.subgraph_store(),
             &deployment,
             TEST_BLOCK_3_PTR.clone(),
             ops,
         )
+        .await
         .expect("Failed to create test users");
 
         // Get the first 2 entries in each 'color group'
@@ -1867,8 +1994,108 @@ fn cleanup_cached_blocks() {
 }
 
 #[test]
+/// checks if retrieving the timestamp from the data blob works.
+/// on ethereum, the block has timestamp as U256 so it will always have a value
+fn parse_timestamp() {
+    const EXPECTED_TS: u64 = 1657712166;
+
+    run_test(|store, _, _| async move {
+        use block_store::*;
+        // The test subgraph is at block 2. Since we don't ever delete
+        // the genesis block, the only block eligible for cleanup is BLOCK_ONE
+        // and the first retained block is block 2.
+        block_store::set_chain(
+            vec![
+                &*GENESIS_BLOCK,
+                &*BLOCK_ONE,
+                &*BLOCK_TWO,
+                &*BLOCK_THREE_TIMESTAMP,
+            ],
+            NETWORK_NAME,
+        );
+        let chain_store = store
+            .block_store()
+            .chain_store(NETWORK_NAME)
+            .expect("fake chain store");
+
+        let (_network, number, timestamp) = chain_store
+            .block_number(&BLOCK_THREE_TIMESTAMP.block_hash())
+            .await
+            .expect("block_number to return correct number and timestamp")
+            .unwrap();
+        assert_eq!(number, 3);
+        assert_eq!(timestamp.unwrap(), EXPECTED_TS);
+    })
+}
+
+#[test]
+fn parse_timestamp_firehose() {
+    const EXPECTED_TS: u64 = 1657712166;
+
+    run_test(|store, _, _| async move {
+        use block_store::*;
+        // The test subgraph is at block 2. Since we don't ever delete
+        // the genesis block, the only block eligible for cleanup is BLOCK_ONE
+        // and the first retained block is block 2.
+        block_store::set_chain(
+            vec![
+                &*GENESIS_BLOCK,
+                &*BLOCK_ONE,
+                &*BLOCK_TWO,
+                &*BLOCK_THREE_TIMESTAMP_FIREHOSE,
+            ],
+            NETWORK_NAME,
+        );
+        let chain_store = store
+            .block_store()
+            .chain_store(NETWORK_NAME)
+            .expect("fake chain store");
+
+        let (_network, number, timestamp) = chain_store
+            .block_number(&BLOCK_THREE_TIMESTAMP_FIREHOSE.block_hash())
+            .await
+            .expect("block_number to return correct number and timestamp")
+            .unwrap();
+        assert_eq!(number, 3);
+        assert_eq!(timestamp.unwrap(), EXPECTED_TS);
+    })
+}
+
+#[test]
+/// checks if retrieving the timestamp from the data blob works.
+/// on ethereum, the block has timestamp as U256 so it will always have a value
+fn parse_null_timestamp() {
+    run_test(|store, _, _| async move {
+        use block_store::*;
+        // The test subgraph is at block 2. Since we don't ever delete
+        // the genesis block, the only block eligible for cleanup is BLOCK_ONE
+        // and the first retained block is block 2.
+        block_store::set_chain(
+            vec![
+                &*GENESIS_BLOCK,
+                &*BLOCK_ONE,
+                &*BLOCK_TWO,
+                &*BLOCK_THREE_NO_TIMESTAMP,
+            ],
+            NETWORK_NAME,
+        );
+        let chain_store = store
+            .block_store()
+            .chain_store(NETWORK_NAME)
+            .expect("fake chain store");
+
+        let (_network, number, timestamp) = chain_store
+            .block_number(&BLOCK_THREE_NO_TIMESTAMP.block_hash())
+            .await
+            .expect("block_number to return correct number and timestamp")
+            .unwrap();
+        assert_eq!(number, 3);
+        assert_eq!(true, timestamp.is_none());
+    })
+}
+#[test]
 fn reorg_tracking() {
-    fn update_john(
+    async fn update_john(
         store: &Arc<DieselSubgraphStore>,
         deployment: &DeploymentLocator,
         age: i32,
@@ -1884,7 +2111,9 @@ fn reorg_tracking() {
             false,
             None,
         );
-        transact_entity_operations(store, deployment, block.clone(), vec![test_entity_1]).unwrap();
+        transact_and_wait(store, deployment, block.clone(), vec![test_entity_1])
+            .await
+            .unwrap();
     }
 
     macro_rules! check_state {
@@ -1898,7 +2127,7 @@ fn reorg_tracking() {
             assert_eq!($reorg_count, state.reorg_count, "reorg_count");
             assert_eq!($max_reorg_depth, state.max_reorg_depth, "max_reorg_depth");
             assert_eq!(
-                $latest_ethereum_block_number, state.latest_ethereum_block_number,
+                $latest_ethereum_block_number, state.latest_block.number,
                 "latest_ethereum_block_number"
             );
         };
@@ -1912,12 +2141,13 @@ fn reorg_tracking() {
         check_state!(store, 0, 0, 2);
 
         // Jump to block 4
-        transact_entity_operations(
+        transact_and_wait(
             &subgraph_store,
             &deployment,
             TEST_BLOCK_4_PTR.clone(),
             vec![],
         )
+        .await
         .unwrap();
         check_state!(store, 0, 0, 4);
 
@@ -1930,15 +2160,15 @@ fn reorg_tracking() {
         check_state!(store, 2, 2, 2);
 
         // Forward to block 3
-        update_john(&subgraph_store, &deployment, 70, &TEST_BLOCK_3_PTR);
+        update_john(&subgraph_store, &deployment, 70, &TEST_BLOCK_3_PTR).await;
         check_state!(store, 2, 2, 3);
 
         // Forward to block 4
-        update_john(&subgraph_store, &deployment, 71, &TEST_BLOCK_4_PTR);
+        update_john(&subgraph_store, &deployment, 71, &TEST_BLOCK_4_PTR).await;
         check_state!(store, 2, 2, 4);
 
         // Forward to block 5
-        update_john(&subgraph_store, &deployment, 72, &TEST_BLOCK_5_PTR);
+        update_john(&subgraph_store, &deployment, 72, &TEST_BLOCK_5_PTR).await;
         check_state!(store, 2, 2, 5);
 
         // Revert all the way back to block 2

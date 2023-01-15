@@ -1,12 +1,19 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
-use graph::prelude::{
-    anyhow::{anyhow, Error},
-    NodeId,
+use graph::{
+    anyhow::bail,
+    components::metrics::MetricsRegistry,
+    itertools::Itertools,
+    prelude::{
+        anyhow::{anyhow, Error},
+        NodeId,
+    },
+    slog::Logger,
 };
+use graph_chain_ethereum::{EthereumAdapterTrait, NodeCapabilities, ProviderEthRpcMetrics};
 use graph_store_postgres::DeploymentPlacer;
 
-use crate::config::Config;
+use crate::{chain::create_ethereum_networks_for_chain, config::Config};
 
 pub fn place(placer: &dyn DeploymentPlacer, name: &str, network: &str) -> Result<(), Error> {
     match placer.place(name, network).map_err(|s| anyhow!(s))? {
@@ -47,7 +54,7 @@ pub fn pools(config: &Config, nodes: Vec<String>, shard: bool) -> Result<(), Err
     let nodes: Vec<_> = nodes
         .into_iter()
         .map(|name| {
-            NodeId::new(name.replace("-", "_"))
+            NodeId::new(name.replace('-', "_"))
                 .map_err(|()| anyhow!("illegal node name `{}`", name))
         })
         .collect::<Result<_, _>>()?;
@@ -87,5 +94,49 @@ pub fn pools(config: &Config, nodes: Vec<String>, shard: bool) -> Result<(), Err
             }
         }
     }
+    Ok(())
+}
+
+pub async fn provider(
+    logger: Logger,
+    config: &Config,
+    registry: Arc<dyn MetricsRegistry>,
+    features: String,
+    network: String,
+) -> Result<(), Error> {
+    // Like NodeCapabilities::from_str but with error checking for typos etc.
+    fn caps_from_features(features: String) -> Result<NodeCapabilities, Error> {
+        let mut caps = NodeCapabilities {
+            archive: false,
+            traces: false,
+        };
+        for feature in features.split(',') {
+            match feature {
+                "archive" => caps.archive = true,
+                "traces" => caps.traces = true,
+                _ => bail!("unknown feature {}", feature),
+            }
+        }
+        Ok(caps)
+    }
+
+    let caps = caps_from_features(features)?;
+    let eth_rpc_metrics = Arc::new(ProviderEthRpcMetrics::new(registry));
+    let networks =
+        create_ethereum_networks_for_chain(&logger, eth_rpc_metrics, config, &network).await?;
+    let adapters = networks
+        .networks
+        .get(&network)
+        .ok_or_else(|| anyhow!("unknown network {}", network))?;
+    let adapters = adapters.all_cheapest_with(&caps);
+    println!(
+        "deploy on network {} with features [{}] on node {}\neligible providers: {}",
+        network,
+        caps,
+        config.node.as_str(),
+        adapters
+            .map(|adapter| adapter.provider().to_string())
+            .join(", ")
+    );
     Ok(())
 }

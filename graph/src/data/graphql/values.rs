@@ -3,9 +3,10 @@ use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::str::FromStr;
 
+use crate::blockchain::BlockHash;
 use crate::data::value::Object;
 use crate::prelude::{r, BigInt, Entity};
-use web3::types::{H160, H256};
+use web3::types::H160;
 
 pub trait TryFromValue: Sized {
     fn try_from_value(value: &r::Value) -> Result<Self, Error>;
@@ -91,16 +92,12 @@ impl TryFromValue for H160 {
     }
 }
 
-impl TryFromValue for H256 {
+impl TryFromValue for BlockHash {
     fn try_from_value(value: &r::Value) -> Result<Self, Error> {
         match value {
-            r::Value::String(s) => {
-                // `H256::from_str` takes a hex string with no leading `0x`.
-                let string = s.trim_start_matches("0x");
-                H256::from_str(string)
-                    .map_err(|e| anyhow!("Cannot parse H256 value from string `{}`: {}", s, e))
-            }
-            _ => Err(anyhow!("Cannot parse value into an H256: {:?}", value)),
+            r::Value::String(s) => BlockHash::from_str(s)
+                .map_err(|e| anyhow!("Cannot parse hex value from string `{}`: {}", s, e)),
+            _ => Err(anyhow!("Cannot parse non-string value: {:?}", value)),
         }
     }
 }
@@ -174,7 +171,7 @@ impl ValueMap for &Object {
     {
         self.get(key)
             .ok_or_else(|| anyhow!("Required field `{}` not set", key))
-            .and_then(|value| T::try_from_value(value).map_err(|e| e.into()))
+            .and_then(T::try_from_value)
     }
 
     fn get_optional<T>(&self, key: &str) -> Result<Option<T>, Error>
@@ -183,7 +180,7 @@ impl ValueMap for &Object {
     {
         self.get(key).map_or(Ok(None), |value| match value {
             r::Value::Null => Ok(None),
-            _ => T::try_from_value(value).map(Some).map_err(Into::into),
+            _ => T::try_from_value(value).map(Some),
         })
     }
 }
@@ -195,7 +192,7 @@ impl ValueMap for &HashMap<&str, r::Value> {
     {
         self.get(key)
             .ok_or_else(|| anyhow!("Required field `{}` not set", key))
-            .and_then(|value| T::try_from_value(value).map_err(|e| e.into()))
+            .and_then(T::try_from_value)
     }
 
     fn get_optional<T>(&self, key: &str) -> Result<Option<T>, Error>
@@ -204,7 +201,7 @@ impl ValueMap for &HashMap<&str, r::Value> {
     {
         self.get(key).map_or(Ok(None), |value| match value {
             r::Value::Null => Ok(None),
-            _ => T::try_from_value(value).map(Some).map_err(Into::into),
+            _ => T::try_from_value(value).map(Some),
         })
     }
 }

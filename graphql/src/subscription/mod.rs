@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use graph::components::store::UnitStream;
 use graph::{components::store::SubscriptionManager, prelude::*};
 
-use crate::runner::ResultSizeMetrics;
+use crate::metrics::GraphQLMetrics;
 use crate::{
     execution::ast as a,
     execution::*,
@@ -37,7 +37,7 @@ pub struct SubscriptionExecutionOptions {
     /// Maximum value for the `skip` argument.
     pub max_skip: u32,
 
-    pub result_size: Arc<ResultSizeMetrics>,
+    pub graphql_metrics: Arc<GraphQLMetrics>,
 }
 
 pub fn execute_subscription(
@@ -52,6 +52,7 @@ pub fn execute_subscription(
         subscription.query,
         options.max_complexity,
         options.max_depth,
+        options.graphql_metrics.cheap_clone(),
     )?;
     execute_prepared_subscription(query, options)
 }
@@ -86,16 +87,17 @@ fn create_source_event_stream(
         query.schema.id().clone(),
         options.store.clone(),
         options.subscription_manager.cheap_clone(),
-        options.result_size.cheap_clone(),
+        options.graphql_metrics.cheap_clone(),
     );
     let ctx = ExecutionContext {
         logger: options.logger.cheap_clone(),
         resolver,
-        query: query.clone(),
+        query,
         deadline: None,
         max_first: options.max_first,
         max_skip: options.max_skip,
         cache_status: Default::default(),
+        trace: ENV_VARS.log_sql_timing(),
     };
 
     let subscription_type = ctx
@@ -118,7 +120,7 @@ fn create_source_event_stream(
         }
     };
 
-    resolve_field_stream(&ctx, &subscription_type, field)
+    resolve_field_stream(&ctx, subscription_type, field)
 }
 
 fn resolve_field_stream(
@@ -152,7 +154,7 @@ fn map_source_to_response_stream(
         max_depth: _,
         max_first,
         max_skip,
-        result_size,
+        graphql_metrics,
     } = options;
 
     trigger_stream
@@ -166,7 +168,7 @@ fn map_source_to_response_stream(
                 timeout,
                 max_first,
                 max_skip,
-                result_size.cheap_clone(),
+                graphql_metrics.cheap_clone(),
             )
             .boxed()
         })
@@ -181,24 +183,36 @@ async fn execute_subscription_event(
     timeout: Option<Duration>,
     max_first: u32,
     max_skip: u32,
-    result_size: Arc<ResultSizeMetrics>,
+    metrics: Arc<GraphQLMetrics>,
 ) -> Arc<QueryResult> {
-    let resolver = match StoreResolver::at_block(
-        &logger,
-        store,
-        subscription_manager,
-        BlockConstraint::Latest,
-        ErrorPolicy::Deny,
-        query.schema.id().clone(),
-        result_size,
-    )
-    .await
+    async fn make_resolver(
+        store: Arc<dyn QueryStore>,
+        logger: &Logger,
+        subscription_manager: Arc<dyn SubscriptionManager>,
+        query: &Arc<crate::execution::Query>,
+        metrics: Arc<GraphQLMetrics>,
+    ) -> Result<StoreResolver, QueryExecutionError> {
+        let state = store.deployment_state().await?;
+        StoreResolver::at_block(
+            logger,
+            store,
+            &state,
+            subscription_manager,
+            BlockConstraint::Latest,
+            ErrorPolicy::Deny,
+            query.schema.id().clone(),
+            metrics,
+        )
+        .await
+    }
+
+    let resolver = match make_resolver(store, &logger, subscription_manager, &query, metrics).await
     {
         Ok(resolver) => resolver,
         Err(e) => return Arc::new(e.into()),
     };
 
-    let block_ptr = resolver.block_ptr.clone();
+    let block_ptr = resolver.block_ptr.as_ref().map(Into::into);
 
     // Create a fresh execution context with deadline.
     let ctx = Arc::new(ExecutionContext {
@@ -209,6 +223,7 @@ async fn execute_subscription_event(
         max_first,
         max_skip,
         cache_status: Default::default(),
+        trace: ENV_VARS.log_sql_timing(),
     });
 
     let subscription_type = match ctx.query.schema.subscription_type.as_ref() {

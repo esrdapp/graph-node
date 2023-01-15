@@ -1,28 +1,25 @@
 use crate::config::{Config, ProviderDetails};
 use ethereum::{EthereumNetworks, ProviderEthRpcMetrics};
-use futures::future::join_all;
+use futures::future::{join_all, try_join_all};
 use futures::TryFutureExt;
 use graph::anyhow::Error;
 use graph::blockchain::{Block as BlockchainBlock, BlockchainKind, ChainIdentifier};
 use graph::cheap_clone::CheapClone;
 use graph::firehose::{FirehoseEndpoint, FirehoseNetworks};
 use graph::ipfs_client::IpfsClient;
-use graph::prelude::{anyhow, tokio, BlockNumber};
+use graph::prelude::{anyhow, tokio};
 use graph::prelude::{prost, MetricsRegistry as MetricsRegistryTrait};
 use graph::slog::{debug, error, info, o, Logger};
+use graph::url::Url;
 use graph::util::security::SafeDisplay;
 use graph_chain_ethereum::{self as ethereum, EthereumAdapterTrait, Transport};
-use graph_core::MetricsRegistry;
-use lazy_static::lazy_static;
 use std::collections::{BTreeMap, HashMap};
-use std::env;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
 // The status of a provider that we learned from connecting to it
 #[derive(PartialEq)]
-enum ProviderNetworkStatus {
+pub enum ProviderNetworkStatus {
     Broken {
         chain_id: String,
         provider: String,
@@ -37,22 +34,6 @@ enum ProviderNetworkStatus {
 /// hash from the client. If we can't get it within that time, we'll try and
 /// continue regardless.
 const NET_VERSION_WAIT_TIME: Duration = Duration::from_secs(30);
-
-lazy_static! {
-    // Default to an Ethereum reorg threshold to 50 blocks
-    pub static ref REORG_THRESHOLD: BlockNumber = env::var("ETHEREUM_REORG_THRESHOLD")
-        .ok()
-        .map(|s| BlockNumber::from_str(&s)
-            .unwrap_or_else(|_| panic!("failed to parse env var ETHEREUM_REORG_THRESHOLD")))
-        .unwrap_or(50);
-
-    // Default to an ancestor count of 50 blocks
-    pub static ref ANCESTOR_COUNT: BlockNumber = env::var("ETHEREUM_ANCESTOR_COUNT")
-        .ok()
-        .map(|s| BlockNumber::from_str(&s)
-             .unwrap_or_else(|_| panic!("failed to parse env var ETHEREUM_ANCESTOR_COUNT")))
-        .unwrap_or(50);
-}
 
 pub fn create_ipfs_clients(logger: &Logger, ipfs_addresses: &Vec<String>) -> Vec<IpfsClient> {
     // Parse the IPFS URL from the `--ipfs` command line argument
@@ -121,68 +102,55 @@ pub fn create_ipfs_clients(logger: &Logger, ipfs_addresses: &Vec<String>) -> Vec
         .collect()
 }
 
-/// Parses an Ethereum connection string and returns the network name and Ethereum adapter.
-pub async fn create_ethereum_networks(
+pub fn create_substreams_networks(
     logger: Logger,
-    registry: Arc<MetricsRegistry>,
     config: &Config,
-) -> Result<EthereumNetworks, anyhow::Error> {
-    let eth_rpc_metrics = Arc::new(ProviderEthRpcMetrics::new(registry));
-    let mut parsed_networks = EthereumNetworks::new();
+) -> BTreeMap<BlockchainKind, FirehoseNetworks> {
+    debug!(
+        logger,
+        "Creating firehose networks [{} chains, ingestor {}]",
+        config.chains.chains.len(),
+        config.chains.ingestor,
+    );
+
+    let mut networks_by_kind = BTreeMap::new();
+
     for (name, chain) in &config.chains.chains {
-        if chain.protocol != BlockchainKind::Ethereum {
-            continue;
-        }
-
         for provider in &chain.providers {
-            if let ProviderDetails::Web3(web3) = &provider.details {
-                let capabilities = web3.node_capabilities();
-
-                let logger = logger.new(o!("provider" => provider.label.clone()));
+            if let ProviderDetails::Substreams(ref firehose) = provider.details {
                 info!(
                     logger,
-                    "Creating transport";
-                    "url" => &web3.url,
-                    "capabilities" => capabilities
+                    "Configuring firehose endpoint";
+                    "provider" => &provider.label,
                 );
 
-                use crate::config::Transport::*;
+                let parsed_networks = networks_by_kind
+                    .entry(chain.protocol)
+                    .or_insert_with(|| FirehoseNetworks::new());
 
-                let transport = match web3.transport {
-                    Rpc => Transport::new_rpc(&web3.url, web3.headers.clone()),
-                    Ipc => Transport::new_ipc(&web3.url).await,
-                    Ws => Transport::new_ws(&web3.url).await,
-                };
-
-                let supports_eip_1898 = !web3.features.contains("no_eip1898");
-
-                parsed_networks.insert(
-                    name.to_string(),
-                    capabilities,
-                    Arc::new(
-                        graph_chain_ethereum::EthereumAdapter::new(
-                            logger,
-                            provider.label.clone(),
-                            &web3.url,
-                            transport,
-                            eth_rpc_metrics.clone(),
-                            supports_eip_1898,
-                        )
-                        .await,
-                    ),
-                );
+                for i in 0..firehose.conn_pool_size {
+                    parsed_networks.insert(
+                        name.to_string(),
+                        Arc::new(FirehoseEndpoint::new(
+                            &format!("{}-{}", provider.label, i),
+                            &firehose.url,
+                            firehose.token.clone(),
+                            firehose.filters_enabled(),
+                            firehose.compression_enabled(),
+                        )),
+                    );
+                }
             }
         }
     }
-    parsed_networks.sort();
-    Ok(parsed_networks)
+
+    networks_by_kind
 }
 
-pub async fn create_firehose_networks(
+pub fn create_firehose_networks(
     logger: Logger,
-    _registry: Arc<dyn MetricsRegistryTrait>,
     config: &Config,
-) -> Result<BTreeMap<BlockchainKind, FirehoseNetworks>, anyhow::Error> {
+) -> BTreeMap<BlockchainKind, FirehoseNetworks> {
     debug!(
         logger,
         "Creating firehose networks [{} chains, ingestor {}]",
@@ -195,30 +163,32 @@ pub async fn create_firehose_networks(
     for (name, chain) in &config.chains.chains {
         for provider in &chain.providers {
             if let ProviderDetails::Firehose(ref firehose) = provider.details {
-                let logger = logger.new(o!("provider" => provider.label.clone()));
                 info!(
                     logger,
-                    "Creating firehose endpoint";
-                    "url" => &firehose.url,
+                    "Configuring firehose endpoint";
+                    "provider" => &provider.label,
                 );
-
-                let endpoint = FirehoseEndpoint::new(
-                    logger,
-                    &provider.label,
-                    &firehose.url,
-                    firehose.token.clone(),
-                )
-                .await?;
 
                 let parsed_networks = networks_by_kind
                     .entry(chain.protocol)
                     .or_insert_with(|| FirehoseNetworks::new());
-                parsed_networks.insert(name.to_string(), Arc::new(endpoint));
+                for i in 0..firehose.conn_pool_size {
+                    parsed_networks.insert(
+                        name.to_string(),
+                        Arc::new(FirehoseEndpoint::new(
+                            &format!("{}-{}", provider.label, i),
+                            &firehose.url,
+                            firehose.token.clone(),
+                            firehose.filters_enabled(),
+                            firehose.compression_enabled(),
+                        )),
+                    );
+                }
             }
         }
     }
 
-    Ok(networks_by_kind)
+    networks_by_kind
 }
 
 /// Try to connect to all the providers in `eth_networks` and get their net
@@ -326,7 +296,7 @@ where
                 let logger = logger.new(o!("provider" => endpoint.provider.to_string()));
                 info!(
                     logger, "Connecting to Firehose to get chain identifier";
-                    "url" => &endpoint.uri,
+                    "provider" => &endpoint.provider,
                 );
                 match tokio::time::timeout(
                     NET_VERSION_WAIT_TIME,
@@ -339,7 +309,7 @@ where
                     // on the URL)
                     Ok(Err(e)) | Err(e) => {
                         error!(logger, "Connection to provider failed. Not using this provider";
-                                       "error" =>  e.to_string());
+                                       "error" =>  format!("{:#}", e));
                         ProviderNetworkStatus::Broken {
                             chain_id,
                             provider: endpoint.provider.to_string(),
@@ -349,7 +319,7 @@ where
                         info!(
                             logger,
                             "Connected to Firehose";
-                            "uri" => &endpoint.uri,
+                            "provider" => &endpoint.provider,
                             "genesis_block" => format_args!("{}", &ptr),
                         );
 
@@ -398,9 +368,95 @@ where
     (firehose_networks, idents)
 }
 
+/// Parses all Ethereum connection strings and returns their network names and
+/// `EthereumAdapter`.
+pub async fn create_all_ethereum_networks(
+    logger: Logger,
+    registry: Arc<dyn MetricsRegistryTrait>,
+    config: &Config,
+) -> anyhow::Result<EthereumNetworks> {
+    let eth_rpc_metrics = Arc::new(ProviderEthRpcMetrics::new(registry));
+    let eth_networks_futures = config
+        .chains
+        .chains
+        .iter()
+        .filter(|(_, chain)| chain.protocol == BlockchainKind::Ethereum)
+        .map(|(name, _)| {
+            create_ethereum_networks_for_chain(&logger, eth_rpc_metrics.clone(), config, name)
+        });
+
+    Ok(try_join_all(eth_networks_futures)
+        .await?
+        .into_iter()
+        .reduce(|mut a, b| {
+            a.extend(b);
+            a
+        })
+        .unwrap_or_else(|| EthereumNetworks::new()))
+}
+
+/// Parses a single Ethereum connection string and returns its network name and `EthereumAdapter`.
+pub async fn create_ethereum_networks_for_chain(
+    logger: &Logger,
+    eth_rpc_metrics: Arc<ProviderEthRpcMetrics>,
+    config: &Config,
+    network_name: &str,
+) -> anyhow::Result<EthereumNetworks> {
+    let mut parsed_networks = EthereumNetworks::new();
+    let chain = config
+        .chains
+        .chains
+        .get(network_name)
+        .ok_or_else(|| anyhow!("unknown network {}", network_name))?;
+
+    for provider in &chain.providers {
+        if let ProviderDetails::Web3(web3) = &provider.details {
+            let capabilities = web3.node_capabilities();
+
+            let logger = logger.new(o!("provider" => provider.label.clone()));
+            info!(
+                logger,
+                "Creating transport";
+                "url" => &web3.url,
+                "capabilities" => capabilities
+            );
+
+            use crate::config::Transport::*;
+
+            let transport = match web3.transport {
+                Rpc => Transport::new_rpc(Url::parse(&web3.url)?, web3.headers.clone()),
+                Ipc => Transport::new_ipc(&web3.url).await,
+                Ws => Transport::new_ws(&web3.url).await,
+            };
+
+            let supports_eip_1898 = !web3.features.contains("no_eip1898");
+
+            parsed_networks.insert(
+                network_name.to_string(),
+                capabilities,
+                Arc::new(
+                    graph_chain_ethereum::EthereumAdapter::new(
+                        logger,
+                        provider.label.clone(),
+                        &web3.url,
+                        transport,
+                        eth_rpc_metrics.clone(),
+                        supports_eip_1898,
+                    )
+                    .await,
+                ),
+                web3.limit_for(&config.node),
+            );
+        }
+    }
+
+    parsed_networks.sort();
+    Ok(parsed_networks)
+}
+
 #[cfg(test)]
 mod test {
-    use crate::chain::create_ethereum_networks;
+    use crate::chain::create_all_ethereum_networks;
     use crate::config::{Config, Opt};
     use graph::log::logger;
     use graph::prelude::tokio;
@@ -439,7 +495,7 @@ mod test {
             prometheus_registry.clone(),
         ));
 
-        let ethereum_networks = create_ethereum_networks(logger, metrics_registry, &config)
+        let ethereum_networks = create_all_ethereum_networks(logger, metrics_registry, &config)
             .await
             .expect("Correctly parse Ethereum network args");
         let mut network_names = ethereum_networks.networks.keys().collect::<Vec<&String>>();

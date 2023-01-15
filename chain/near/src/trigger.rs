@@ -1,14 +1,11 @@
-use graph::blockchain;
 use graph::blockchain::Block;
 use graph::blockchain::TriggerData;
 use graph::cheap_clone::CheapClone;
 use graph::prelude::hex;
 use graph::prelude::web3::types::H256;
 use graph::prelude::BlockNumber;
-use graph::runtime::asc_new;
-use graph::runtime::AscHeap;
-use graph::runtime::AscPtr;
-use graph::runtime::DeterministicHostError;
+use graph::runtime::{asc_new, gas::GasCounter, AscHeap, AscPtr, DeterministicHostError};
+use graph_runtime_wasm::module::ToAscPtr;
 use std::{cmp::Ordering, sync::Arc};
 
 use crate::codec;
@@ -38,11 +35,15 @@ impl std::fmt::Debug for NearTrigger {
     }
 }
 
-impl blockchain::MappingTrigger for NearTrigger {
-    fn to_asc_ptr<H: AscHeap>(self, heap: &mut H) -> Result<AscPtr<()>, DeterministicHostError> {
+impl ToAscPtr for NearTrigger {
+    fn to_asc_ptr<H: AscHeap>(
+        self,
+        heap: &mut H,
+        gas: &GasCounter,
+    ) -> Result<AscPtr<()>, DeterministicHostError> {
         Ok(match self {
-            NearTrigger::Block(block) => asc_new(heap, block.as_ref())?.erase(),
-            NearTrigger::Receipt(receipt) => asc_new(heap, receipt.as_ref())?.erase(),
+            NearTrigger::Block(block) => asc_new(heap, block.as_ref(), gas)?.erase(),
+            NearTrigger::Receipt(receipt) => asc_new(heap, receipt.as_ref(), gas)?.erase(),
         })
     }
 }
@@ -149,6 +150,8 @@ mod tests {
         anyhow::anyhow,
         data::subgraph::API_VERSION_0_0_5,
         prelude::{hex, BigInt},
+        runtime::gas::GasCounter,
+        util::mem::init_slice,
     };
 
     #[test]
@@ -156,7 +159,7 @@ mod tests {
         let mut heap = BytesHeap::new(API_VERSION_0_0_5);
         let trigger = NearTrigger::Block(Arc::new(block()));
 
-        let result = blockchain::MappingTrigger::to_asc_ptr(trigger, &mut heap);
+        let result = trigger.to_asc_ptr(&mut heap, &GasCounter::default());
         assert!(result.is_ok());
     }
 
@@ -169,7 +172,7 @@ mod tests {
             receipt: receipt().unwrap(),
         }));
 
-        let result = blockchain::MappingTrigger::to_asc_ptr(trigger, &mut heap);
+        let result = trigger.to_asc_ptr(&mut heap, &GasCounter::default());
         assert!(result.is_ok());
     }
 
@@ -390,7 +393,7 @@ mod tests {
 
     fn big_int(input: u64) -> Option<codec::BigInt> {
         let value =
-            BigInt::try_from(input).expect(format!("Invalid BigInt value {}", input).as_ref());
+            BigInt::try_from(input).unwrap_or_else(|_| panic!("Invalid BigInt value {}", input));
         let bytes = value.to_signed_bytes_le();
 
         Some(codec::BigInt { bytes })
@@ -398,21 +401,23 @@ mod tests {
 
     fn hash(input: &str) -> Option<codec::CryptoHash> {
         Some(codec::CryptoHash {
-            bytes: hex::decode(input).expect(format!("Invalid hash value {}", input).as_ref()),
+            bytes: hex::decode(input).unwrap_or_else(|_| panic!("Invalid hash value {}", input)),
         })
     }
 
     fn public_key(input: &str) -> Option<codec::PublicKey> {
         Some(codec::PublicKey {
             r#type: 0,
-            bytes: hex::decode(input).expect(format!("Invalid PublicKey value {}", input).as_ref()),
+            bytes: hex::decode(input)
+                .unwrap_or_else(|_| panic!("Invalid PublicKey value {}", input)),
         })
     }
 
     fn signature(input: &str) -> Option<codec::Signature> {
         Some(codec::Signature {
             r#type: 0,
-            bytes: hex::decode(input).expect(format!("Invalid Signature value {}", input).as_ref()),
+            bytes: hex::decode(input)
+                .unwrap_or_else(|_| panic!("Invalid Signature value {}", input)),
         })
     }
 
@@ -431,12 +436,27 @@ mod tests {
     }
 
     impl AscHeap for BytesHeap {
-        fn raw_new(&mut self, bytes: &[u8]) -> Result<u32, DeterministicHostError> {
+        fn raw_new(
+            &mut self,
+            bytes: &[u8],
+            _gas: &GasCounter,
+        ) -> Result<u32, DeterministicHostError> {
             self.memory.extend_from_slice(bytes);
             Ok((self.memory.len() - bytes.len()) as u32)
         }
 
-        fn get(&self, offset: u32, size: u32) -> Result<Vec<u8>, DeterministicHostError> {
+        fn read_u32(&self, offset: u32, gas: &GasCounter) -> Result<u32, DeterministicHostError> {
+            let mut data = [std::mem::MaybeUninit::<u8>::uninit(); 4];
+            let init = self.read(offset, &mut data, gas)?;
+            Ok(u32::from_le_bytes(init.try_into().unwrap()))
+        }
+
+        fn read<'a>(
+            &self,
+            offset: u32,
+            buffer: &'a mut [std::mem::MaybeUninit<u8>],
+            _gas: &GasCounter,
+        ) -> Result<&'a mut [u8], DeterministicHostError> {
             let memory_byte_count = self.memory.len();
             if memory_byte_count == 0 {
                 return Err(DeterministicHostError::from(anyhow!(
@@ -445,7 +465,7 @@ mod tests {
             }
 
             let start_offset = offset as usize;
-            let end_offset_exclusive = start_offset + size as usize;
+            let end_offset_exclusive = start_offset + buffer.len();
 
             if start_offset >= memory_byte_count {
                 return Err(DeterministicHostError::from(anyhow!(
@@ -463,7 +483,9 @@ mod tests {
                 )));
             }
 
-            return Ok(Vec::from(&self.memory[start_offset..end_offset_exclusive]));
+            let src = &self.memory[start_offset..end_offset_exclusive];
+
+            Ok(init_slice(src, buffer))
         }
 
         fn api_version(&self) -> graph::semver::Version {

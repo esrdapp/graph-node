@@ -3,14 +3,34 @@ use std::{marker::PhantomData, sync::Arc, time::Duration};
 use crate::{
     blockchain::Block as BlockchainBlock,
     components::store::ChainStore,
-    firehose::{self, decode_firehose_block, FirehoseEndpoint},
+    firehose::{self, decode_firehose_block, FirehoseEndpoint, HeaderOnly},
     prelude::{error, info, Logger},
     util::backoff::ExponentialBackoff,
 };
 use anyhow::{Context, Error};
 use futures03::StreamExt;
+use prost::Message;
+use prost_types::Any;
 use slog::trace;
 use tonic::Streaming;
+
+const TRANSFORM_ETHEREUM_HEADER_ONLY: &str =
+    "type.googleapis.com/sf.ethereum.transform.v1.HeaderOnly";
+
+pub enum Transforms {
+    EthereumHeaderOnly,
+}
+
+impl Into<Any> for &Transforms {
+    fn into(self) -> Any {
+        match self {
+            Transforms::EthereumHeaderOnly => Any {
+                type_url: TRANSFORM_ETHEREUM_HEADER_ONLY.to_owned(),
+                value: HeaderOnly {}.encode_to_vec(),
+            },
+        }
+    }
+}
 
 pub struct FirehoseBlockIngestor<M>
 where
@@ -19,6 +39,7 @@ where
     chain_store: Arc<dyn ChainStore>,
     endpoint: Arc<FirehoseEndpoint>,
     logger: Logger,
+    default_transforms: Vec<Transforms>,
 
     phantom: PhantomData<M>,
 }
@@ -37,12 +58,16 @@ where
             endpoint,
             logger,
             phantom: PhantomData {},
+            default_transforms: vec![],
         }
     }
 
-    pub async fn run(self) {
-        use firehose::ForkStep::*;
+    pub fn with_transforms(mut self, transforms: Vec<Transforms>) -> Self {
+        self.default_transforms = transforms;
+        self
+    }
 
+    pub async fn run(self) {
         let mut latest_cursor = self.fetch_head_cursor().await;
         let mut backoff =
             ExponentialBackoff::new(Duration::from_millis(250), Duration::from_secs(30));
@@ -59,8 +84,9 @@ where
                 .stream_blocks(firehose::Request {
                     // Starts at current HEAD block of the chain (viewed from Firehose side)
                     start_block_num: -1,
-                    start_cursor: latest_cursor.clone(),
-                    fork_steps: vec![StepNew as i32, StepUndo as i32],
+                    cursor: latest_cursor.clone(),
+                    final_blocks_only: false,
+                    transforms: self.default_transforms.iter().map(|t| t.into()).collect(),
                     ..Default::default()
                 })
                 .await;
@@ -73,7 +99,7 @@ where
                     latest_cursor = self.process_blocks(latest_cursor, stream).await
                 }
                 Err(e) => {
-                    error!(self.logger, "Unable to connect to endpoint: {:?}", e);
+                    error!(self.logger, "Unable to connect to endpoint: {:#}", e);
                 }
             }
 
@@ -89,7 +115,7 @@ where
             match self.chain_store.clone().chain_head_cursor() {
                 Ok(cursor) => return cursor.unwrap_or_else(|| "".to_string()),
                 Err(e) => {
-                    error!(self.logger, "Fetching chain head cursor failed: {:?}", e);
+                    error!(self.logger, "Fetching chain head cursor failed: {:#}", e);
 
                     backoff.sleep_async().await;
                 }
@@ -122,13 +148,13 @@ where
                             trace!(self.logger, "Received undo block to ingest, skipping");
                             Ok(())
                         }
-                        StepIrreversible | StepUnknown => panic!(
+                        StepFinal | StepUnset => panic!(
                             "We explicitly requested StepNew|StepUndo but received something else"
                         ),
                     };
 
                     if let Err(e) = result {
-                        error!(self.logger, "Process block failed: {:?}", e);
+                        error!(self.logger, "Process block failed: {:#}", e);
                         break;
                     }
 

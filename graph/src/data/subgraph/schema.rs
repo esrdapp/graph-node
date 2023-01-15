@@ -1,11 +1,10 @@
 //! Entity types that contain the graph-node state.
 
-use anyhow::{anyhow, Error};
+use anyhow::{anyhow, bail, Error};
 use hex;
 use lazy_static::lazy_static;
 use rand::rngs::OsRng;
 use rand::Rng;
-use stable_hash::{SequenceNumber, StableHash, StableHasher};
 use std::str::FromStr;
 use std::{fmt, fmt::Display};
 
@@ -14,6 +13,7 @@ use crate::data::graphql::TryFromValue;
 use crate::data::store::Value;
 use crate::data::subgraph::SubgraphManifest;
 use crate::prelude::*;
+use crate::util::stable_hash_glue::impl_stable_hash;
 use crate::{blockchain::Blockchain, components::store::EntityType};
 
 pub const POI_TABLE: &str = "poi2$";
@@ -21,7 +21,8 @@ lazy_static! {
     pub static ref POI_OBJECT: EntityType = EntityType::new("Poi$".to_string());
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SubgraphHealth {
     /// Syncing without errors.
     Healthy,
@@ -99,6 +100,46 @@ impl TryFromValue for SubgraphHealth {
     }
 }
 
+/// The deployment data that is needed to create a deployment
+pub struct DeploymentCreate {
+    pub manifest: SubgraphManifestEntity,
+    pub start_block: Option<BlockPtr>,
+    pub graft_base: Option<DeploymentHash>,
+    pub graft_block: Option<BlockPtr>,
+    pub debug_fork: Option<DeploymentHash>,
+}
+
+impl DeploymentCreate {
+    pub fn new(
+        raw_manifest: String,
+        source_manifest: &SubgraphManifest<impl Blockchain>,
+        start_block: Option<BlockPtr>,
+    ) -> Self {
+        Self {
+            manifest: SubgraphManifestEntity::new(raw_manifest, source_manifest),
+            start_block: start_block.cheap_clone(),
+            graft_base: None,
+            graft_block: None,
+            debug_fork: None,
+        }
+    }
+
+    pub fn graft(mut self, base: Option<(DeploymentHash, BlockPtr)>) -> Self {
+        if let Some((subgraph, ptr)) = base {
+            self.graft_base = Some(subgraph);
+            self.graft_block = Some(ptr);
+        }
+        self
+    }
+
+    pub fn debug(mut self, fork: Option<DeploymentHash>) -> Self {
+        self.debug_fork = fork;
+        self
+    }
+}
+
+/// The representation of a subgraph deployment when reading an existing
+/// deployment
 #[derive(Debug)]
 pub struct SubgraphDeploymentEntity {
     pub manifest: SubgraphManifestEntity,
@@ -107,48 +148,17 @@ pub struct SubgraphDeploymentEntity {
     pub synced: bool,
     pub fatal_error: Option<SubgraphError>,
     pub non_fatal_errors: Vec<SubgraphError>,
-    pub earliest_block: Option<BlockPtr>,
+    /// The earliest block for which we have data
+    pub earliest_block_number: BlockNumber,
+    /// The block at which indexing initially started
+    pub start_block: Option<BlockPtr>,
     pub latest_block: Option<BlockPtr>,
     pub graft_base: Option<DeploymentHash>,
     pub graft_block: Option<BlockPtr>,
+    pub debug_fork: Option<DeploymentHash>,
     pub reorg_count: i32,
     pub current_reorg_depth: i32,
     pub max_reorg_depth: i32,
-}
-
-impl SubgraphDeploymentEntity {
-    pub fn new(
-        source_manifest: &SubgraphManifest<impl Blockchain>,
-        synced: bool,
-        earliest_block: Option<BlockPtr>,
-    ) -> Self {
-        Self {
-            manifest: SubgraphManifestEntity::from(source_manifest),
-            failed: false,
-            health: SubgraphHealth::Healthy,
-            synced,
-            fatal_error: None,
-            non_fatal_errors: vec![],
-            earliest_block: earliest_block.cheap_clone(),
-            latest_block: earliest_block,
-            graft_base: None,
-            graft_block: None,
-            reorg_count: 0,
-            current_reorg_depth: 0,
-            max_reorg_depth: 0,
-        }
-    }
-
-    pub fn graft(mut self, base: Option<(DeploymentHash, BlockPtr)>) -> Self {
-        if let Some((subgraph, ptr)) = base {
-            self.graft_base = Some(subgraph);
-            self.graft_block = Some(ptr);
-            // When we graft, the block pointer is only set after copying
-            // from the base subgraph finished successfully
-            self.latest_block = None;
-        }
-        self
-    }
 }
 
 #[derive(Debug)]
@@ -158,21 +168,55 @@ pub struct SubgraphManifestEntity {
     pub repository: Option<String>,
     pub features: Vec<String>,
     pub schema: String,
+    pub raw_yaml: Option<String>,
 }
 
-impl<'a, C: Blockchain> From<&'a super::SubgraphManifest<C>> for SubgraphManifestEntity {
-    fn from(manifest: &'a super::SubgraphManifest<C>) -> Self {
+impl SubgraphManifestEntity {
+    pub fn new(raw_yaml: String, manifest: &super::SubgraphManifest<impl Blockchain>) -> Self {
         Self {
             spec_version: manifest.spec_version.to_string(),
             description: manifest.description.clone(),
             repository: manifest.repository.clone(),
             features: manifest.features.iter().map(|f| f.to_string()).collect(),
             schema: manifest.schema.document.clone().to_string(),
+            raw_yaml: Some(raw_yaml),
         }
+    }
+
+    pub fn template_idx_and_name(&self) -> Result<Vec<(i32, String)>, Error> {
+        #[derive(Debug, Deserialize)]
+        struct MinimalDs {
+            name: String,
+        }
+        #[derive(Debug, Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct MinimalManifest {
+            data_sources: Vec<MinimalDs>,
+            #[serde(default)]
+            templates: Vec<MinimalDs>,
+        }
+
+        let raw_yaml = match &self.raw_yaml {
+            Some(raw_yaml) => raw_yaml,
+            None => bail!("raw_yaml not present"),
+        };
+
+        let manifest: MinimalManifest = serde_yaml::from_str(raw_yaml)?;
+
+        let ds_len = manifest.data_sources.len() as i32;
+        let template_idx_and_name = manifest
+            .templates
+            .iter()
+            .map(|t| t.name.to_owned())
+            .enumerate()
+            .map(move |(idx, name)| (ds_len + idx as i32, name))
+            .collect();
+
+        Ok(template_idx_and_name)
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SubgraphError {
     pub subgraph_id: DeploymentHash,
     pub message: String,
@@ -196,26 +240,17 @@ impl Display for SubgraphError {
     }
 }
 
-impl StableHash for SubgraphError {
-    fn stable_hash<H: StableHasher>(&self, mut sequence_number: H::Seq, state: &mut H) {
-        let SubgraphError {
-            subgraph_id,
-            message,
-            block_ptr,
-            handler,
-            deterministic,
-        } = self;
-        subgraph_id.stable_hash(sequence_number.next_child(), state);
-        message.stable_hash(sequence_number.next_child(), state);
-        block_ptr.stable_hash(sequence_number.next_child(), state);
-        handler.stable_hash(sequence_number.next_child(), state);
-        deterministic.stable_hash(sequence_number.next_child(), state);
-    }
-}
+impl_stable_hash!(SubgraphError {
+    subgraph_id,
+    message,
+    block_ptr,
+    handler,
+    deterministic
+});
 
 pub fn generate_entity_id() -> String {
     // Fast crypto RNG from operating system
-    let mut rng = OsRng::new().unwrap();
+    let mut rng = OsRng::default();
 
     // 128 random bits
     let id_bytes: [u8; 16] = rng.gen();

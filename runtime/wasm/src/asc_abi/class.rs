@@ -1,13 +1,17 @@
-use crate::asc_abi::{v0_0_4, v0_0_5};
 use ethabi;
+use semver::Version;
+
 use graph::{
     data::store,
-    runtime::{AscHeap, AscIndexId, AscType, AscValue, IndexForAscTypeId},
+    runtime::{
+        gas::GasCounter, AscHeap, AscIndexId, AscType, AscValue, IndexForAscTypeId, ToAscObj,
+    },
 };
 use graph::{prelude::serde_json, runtime::DeterministicHostError};
 use graph::{prelude::slog, runtime::AscPtr};
 use graph_runtime_derive::AscType;
-use semver::Version;
+
+use crate::asc_abi::{v0_0_4, v0_0_5};
 
 ///! Rust types that have with a direct correspondence to an Asc class,
 ///! with their `AscType` implementations.
@@ -59,8 +63,9 @@ impl AscType for ArrayBuffer {
     fn asc_size<H: AscHeap + ?Sized>(
         ptr: AscPtr<Self>,
         heap: &H,
+        gas: &GasCounter,
     ) -> Result<u32, DeterministicHostError> {
-        v0_0_4::ArrayBuffer::asc_size(AscPtr::new(ptr.wasm_ptr()), heap)
+        v0_0_4::ArrayBuffer::asc_size(AscPtr::new(ptr.wasm_ptr()), heap, gas)
     }
 
     fn content_len(&self, asc_bytes: &[u8]) -> usize {
@@ -86,24 +91,26 @@ impl<T: AscValue> TypedArray<T> {
     pub fn new<H: AscHeap + ?Sized>(
         content: &[T],
         heap: &mut H,
+        gas: &GasCounter,
     ) -> Result<Self, DeterministicHostError> {
         match heap.api_version() {
             version if version <= Version::new(0, 0, 4) => Ok(Self::ApiVersion0_0_4(
-                v0_0_4::TypedArray::new(content, heap)?,
+                v0_0_4::TypedArray::new(content, heap, gas)?,
             )),
             _ => Ok(Self::ApiVersion0_0_5(v0_0_5::TypedArray::new(
-                content, heap,
+                content, heap, gas,
             )?)),
         }
     }
 
-    pub(crate) fn to_vec<H: AscHeap + ?Sized>(
+    pub fn to_vec<H: AscHeap + ?Sized>(
         &self,
         heap: &H,
+        gas: &GasCounter,
     ) -> Result<Vec<T>, DeterministicHostError> {
         match self {
-            Self::ApiVersion0_0_4(t) => t.to_vec(heap),
-            Self::ApiVersion0_0_5(t) => t.to_vec(heap),
+            Self::ApiVersion0_0_4(t) => t.to_vec(heap, gas),
+            Self::ApiVersion0_0_5(t) => t.to_vec(heap, gas),
         }
     }
 }
@@ -132,7 +139,18 @@ impl<T> AscType for TypedArray<T> {
     }
 }
 
+pub struct Bytes<'a>(pub &'a Vec<u8>);
+
 pub type Uint8Array = TypedArray<u8>;
+impl ToAscObj<Uint8Array> for Bytes<'_> {
+    fn to_asc_obj<H: AscHeap + ?Sized>(
+        &self,
+        heap: &mut H,
+        gas: &GasCounter,
+    ) -> Result<Uint8Array, DeterministicHostError> {
+        self.0.to_asc_obj(heap, gas)
+    }
+}
 
 impl AscIndexId for TypedArray<i8> {
     const INDEX_ASC_TYPE_ID: IndexForAscTypeId = IndexForAscTypeId::Int8Array;
@@ -229,8 +247,9 @@ impl AscType for AscString {
     fn asc_size<H: AscHeap + ?Sized>(
         ptr: AscPtr<Self>,
         heap: &H,
+        gas: &GasCounter,
     ) -> Result<u32, DeterministicHostError> {
-        v0_0_4::AscString::asc_size(AscPtr::new(ptr.wasm_ptr()), heap)
+        v0_0_4::AscString::asc_size(AscPtr::new(ptr.wasm_ptr()), heap, gas)
     }
 
     fn content_len(&self, asc_bytes: &[u8]) -> usize {
@@ -252,22 +271,26 @@ impl<T: AscValue> Array<T> {
     pub fn new<H: AscHeap + ?Sized>(
         content: &[T],
         heap: &mut H,
+        gas: &GasCounter,
     ) -> Result<Self, DeterministicHostError> {
         match heap.api_version() {
-            version if version <= Version::new(0, 0, 4) => {
-                Ok(Self::ApiVersion0_0_4(v0_0_4::Array::new(content, heap)?))
-            }
-            _ => Ok(Self::ApiVersion0_0_5(v0_0_5::Array::new(content, heap)?)),
+            version if version <= Version::new(0, 0, 4) => Ok(Self::ApiVersion0_0_4(
+                v0_0_4::Array::new(content, heap, gas)?,
+            )),
+            _ => Ok(Self::ApiVersion0_0_5(v0_0_5::Array::new(
+                content, heap, gas,
+            )?)),
         }
     }
 
     pub(crate) fn to_vec<H: AscHeap + ?Sized>(
         &self,
         heap: &H,
+        gas: &GasCounter,
     ) -> Result<Vec<T>, DeterministicHostError> {
         match self {
-            Self::ApiVersion0_0_4(a) => a.to_vec(heap),
-            Self::ApiVersion0_0_5(a) => a.to_vec(heap),
+            Self::ApiVersion0_0_4(a) => a.to_vec(heap, gas),
+            Self::ApiVersion0_0_5(a) => a.to_vec(heap, gas),
         }
     }
 }
@@ -682,7 +705,7 @@ impl AscIndexId for AscResult<AscPtr<AscEnum<JsonValueKind>>, bool> {
 }
 
 #[repr(C)]
-#[derive(AscType)]
+#[derive(AscType, Copy, Clone)]
 pub struct AscWrapped<V: AscValue> {
     pub inner: V,
 }
@@ -697,12 +720,4 @@ impl AscIndexId for AscWrapped<bool> {
 
 impl AscIndexId for AscWrapped<AscPtr<AscEnum<JsonValueKind>>> {
     const INDEX_ASC_TYPE_ID: IndexForAscTypeId = IndexForAscTypeId::WrappedJsonValue;
-}
-
-impl<V: AscValue> Copy for AscWrapped<V> {}
-
-impl<V: AscValue> Clone for AscWrapped<V> {
-    fn clone(&self) -> Self {
-        Self { inner: self.inner }
-    }
 }

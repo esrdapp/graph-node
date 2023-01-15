@@ -17,7 +17,6 @@ pub enum GraphQlTarget {
     SubgraphName(String),
     Deployment(DeploymentHash),
 }
-
 /// A component that can run GraphqL queries against a [Store](../store/trait.Store.html).
 #[async_trait]
 pub trait GraphQlRunner: Send + Sync + 'static {
@@ -43,6 +42,15 @@ pub trait GraphQlRunner: Send + Sync + 'static {
     ) -> Result<SubscriptionResult, SubscriptionError>;
 
     fn load_manager(&self) -> Arc<LoadManager>;
+
+    fn metrics(&self) -> Arc<dyn GraphQLMetrics>;
+}
+
+pub trait GraphQLMetrics: Send + Sync + 'static {
+    fn observe_query_execution(&self, duration: Duration, results: &QueryResults);
+    fn observe_query_parsing(&self, duration: Duration, results: &QueryResults);
+    fn observe_query_validation(&self, duration: Duration, id: &DeploymentHash);
+    fn observe_query_validation_error(&self, error_codes: Vec<&str>, id: &DeploymentHash);
 }
 
 #[async_trait]

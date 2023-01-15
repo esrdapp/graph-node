@@ -3,20 +3,26 @@ use diesel::{connection::SimpleConnection, prelude::RunQueryDsl, select};
 use diesel::{insert_into, OptionalExtension};
 use diesel::{pg::PgConnection, sql_query};
 use diesel::{
-    sql_types::{Array, Nullable, Text},
+    sql_types::{Array, Double, Nullable, Text},
     ExpressionMethods, QueryDsl,
 };
-use std::collections::{HashMap, HashSet};
+use graph::components::store::VersionStats;
+use itertools::Itertools;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write;
 use std::iter::FromIterator;
 use std::sync::Arc;
+use std::time::Duration;
 
 use graph::prelude::anyhow::anyhow;
-use graph::{data::subgraph::schema::POI_TABLE, prelude::StoreError};
+use graph::{
+    data::subgraph::schema::POI_TABLE,
+    prelude::{lazy_static, StoreError},
+};
 
 use crate::connection_pool::ForeignServer;
 use crate::{
-    primary::{Namespace, Site},
+    primary::{Namespace, Site, NAMESPACE_PUBLIC},
     relational::SqlName,
 };
 
@@ -31,12 +37,61 @@ table! {
     }
 }
 
-// Readonly; we only access the name
+// Readonly;  not all columns are mapped
 table! {
-    pg_namespace(nspname) {
-        nspname -> Text,
+    pg_namespace(oid) {
+        oid -> Oid,
+        #[sql_name = "nspname"]
+        name -> Text,
     }
 }
+// Readonly; only mapping the columns we want
+table! {
+    pg_database(datname) {
+        datname -> Text,
+        datcollate -> Text,
+        datctype -> Text,
+    }
+}
+
+// Readonly; not all columns are mapped
+table! {
+    pg_class(oid) {
+        oid -> Oid,
+        #[sql_name = "relname"]
+        name -> Text,
+        #[sql_name = "relnamespace"]
+        namespace -> Oid,
+        #[sql_name = "relpages"]
+        pages -> Integer,
+        #[sql_name = "reltuples"]
+        tuples -> Integer,
+        #[sql_name = "relkind"]
+        kind -> Char,
+        #[sql_name = "relnatts"]
+        natts -> Smallint,
+    }
+}
+
+// Readonly; not all columns are mapped
+table! {
+    pg_attribute(oid) {
+        #[sql_name = "attrelid"]
+        oid -> Oid,
+        #[sql_name = "attrelid"]
+        relid -> Oid,
+        #[sql_name = "attname"]
+        name -> Text,
+        #[sql_name = "attnum"]
+        num -> Smallint,
+        #[sql_name = "attstattarget"]
+        stats_target -> Integer,
+    }
+}
+
+joinable!(pg_class -> pg_namespace(namespace));
+joinable!(pg_attribute -> pg_class(relid));
+allow_tables_to_appear_in_same_query!(pg_class, pg_namespace, pg_attribute);
 
 table! {
     subgraphs.table_stats {
@@ -47,26 +102,127 @@ table! {
     }
 }
 
+table! {
+    __diesel_schema_migrations(version) {
+        version -> Text,
+        run_on -> Timestamp,
+    }
+}
+
+lazy_static! {
+    /// The name of the table in which Diesel records migrations
+    static ref MIGRATIONS_TABLE: SqlName =
+        SqlName::verbatim("__diesel_schema_migrations".to_string());
+}
+
+// In debug builds (for testing etc.) create exclusion constraints, in
+// release builds for production, skip them
+#[cfg(debug_assertions)]
+const CREATE_EXCLUSION_CONSTRAINT: bool = true;
+#[cfg(not(debug_assertions))]
+const CREATE_EXCLUSION_CONSTRAINT: bool = false;
+
+pub struct Locale {
+    collate: String,
+    ctype: String,
+    encoding: String,
+}
+
+impl Locale {
+    /// Load locale information for current database
+    pub fn load(conn: &PgConnection) -> Result<Locale, StoreError> {
+        use diesel::dsl::sql;
+        use pg_database as db;
+
+        let (collate, ctype, encoding) = db::table
+            .filter(db::datname.eq(sql("current_database()")))
+            .select((
+                db::datcollate,
+                db::datctype,
+                sql::<Text>("pg_encoding_to_char(encoding)::text"),
+            ))
+            .get_result::<(String, String, String)>(conn)?;
+        Ok(Locale {
+            collate,
+            ctype,
+            encoding,
+        })
+    }
+
+    pub fn suitable(&self) -> Result<(), String> {
+        if self.collate != "C" {
+            return Err(format!(
+                "database collation is `{}` but must be `C`",
+                self.collate
+            ));
+        }
+        if self.ctype != "C" {
+            return Err(format!(
+                "database ctype is `{}` but must be `C`",
+                self.ctype
+            ));
+        }
+        if self.encoding != "UTF8" {
+            return Err(format!(
+                "database encoding is `{}` but must be `UTF8`",
+                self.encoding
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Information about what tables and columns we have in the database
 #[derive(Debug, Clone)]
 pub struct Catalog {
     pub site: Arc<Site>,
     text_columns: HashMap<String, HashSet<String>>,
+    pub use_poi: bool,
+    /// Whether `bytea` columns are indexed with just a prefix (`true`) or
+    /// in their entirety. This influences both DDL generation and how
+    /// queries are generated
+    pub use_bytea_prefix: bool,
 }
 
 impl Catalog {
-    pub fn new(conn: &PgConnection, site: Arc<Site>) -> Result<Self, StoreError> {
+    /// Load the catalog for an existing subgraph
+    pub fn load(
+        conn: &PgConnection,
+        site: Arc<Site>,
+        use_bytea_prefix: bool,
+    ) -> Result<Self, StoreError> {
         let text_columns = get_text_columns(conn, &site.namespace)?;
-        Ok(Catalog { site, text_columns })
+        let use_poi = supports_proof_of_indexing(conn, &site.namespace)?;
+        Ok(Catalog {
+            site,
+            text_columns,
+            use_poi,
+            use_bytea_prefix,
+        })
+    }
+
+    /// Return a new catalog suitable for creating a new subgraph
+    pub fn for_creation(site: Arc<Site>) -> Self {
+        Catalog {
+            site,
+            text_columns: HashMap::default(),
+            // DDL generation creates a POI table
+            use_poi: true,
+            // DDL generation creates indexes for prefixes of bytes columns
+            // see: attr-bytea-prefix
+            use_bytea_prefix: true,
+        }
     }
 
     /// Make a catalog as if the given `schema` did not exist in the database
     /// yet. This function should only be used in situations where a database
     /// connection is definitely not available, such as in unit tests
-    pub fn make_empty(site: Arc<Site>) -> Result<Self, StoreError> {
+    pub fn for_tests(site: Arc<Site>) -> Result<Self, StoreError> {
         Ok(Catalog {
             site,
             text_columns: HashMap::default(),
+            use_poi: false,
+            use_bytea_prefix: true,
         })
     }
 
@@ -77,6 +233,12 @@ impl Catalog {
             .get(table.as_str())
             .map(|cols| cols.contains(column.as_str()))
             .unwrap_or(false)
+    }
+
+    /// Whether to create exclusion indexes; if false, create gist indexes
+    /// w/o an exclusion constraint
+    pub fn create_exclusion_constraint() -> bool {
+        CREATE_EXCLUSION_CONSTRAINT
     }
 }
 
@@ -110,9 +272,10 @@ fn get_text_columns(
     Ok(map)
 }
 
-pub fn supports_proof_of_indexing(
-    conn: &diesel::pg::PgConnection,
-    namespace: &Namespace,
+pub fn table_exists(
+    conn: &PgConnection,
+    namespace: &str,
+    table: &SqlName,
 ) -> Result<bool, StoreError> {
     #[derive(Debug, QueryableByName)]
     struct Table {
@@ -123,10 +286,20 @@ pub fn supports_proof_of_indexing(
     let query =
         "SELECT table_name FROM information_schema.tables WHERE table_schema=$1 AND table_name=$2";
     let result: Vec<Table> = diesel::sql_query(query)
-        .bind::<Text, _>(namespace.as_str())
-        .bind::<Text, _>(POI_TABLE)
+        .bind::<Text, _>(namespace)
+        .bind::<Text, _>(table.as_str())
         .load(conn)?;
-    Ok(result.len() > 0)
+    Ok(!result.is_empty())
+}
+
+pub fn supports_proof_of_indexing(
+    conn: &diesel::pg::PgConnection,
+    namespace: &Namespace,
+) -> Result<bool, StoreError> {
+    lazy_static! {
+        static ref POI_TABLE_NAME: SqlName = SqlName::verbatim(POI_TABLE.to_owned());
+    }
+    table_exists(conn, namespace.as_str(), &POI_TABLE_NAME)
 }
 
 pub fn current_servers(conn: &PgConnection) -> Result<Vec<String>, StoreError> {
@@ -172,7 +345,7 @@ pub fn has_namespace(conn: &PgConnection, namespace: &Namespace) -> Result<bool,
     use pg_namespace as nsp;
 
     Ok(select(diesel::dsl::exists(
-        nsp::table.filter(nsp::nspname.eq(namespace.as_str())),
+        nsp::table.filter(nsp::name.eq(namespace.as_str())),
     ))
     .get_result::<bool>(conn)?)
 }
@@ -205,6 +378,22 @@ pub fn recreate_schema(conn: &PgConnection, nsp: &str) -> Result<(), StoreError>
         nsp = nsp
     );
     Ok(conn.batch_execute(&query)?)
+}
+
+/// Drop the schema `nsp` and all its contents if it exists
+pub fn drop_schema(conn: &PgConnection, nsp: &str) -> Result<(), StoreError> {
+    let query = format!("drop schema if exists {nsp} cascade;", nsp = nsp);
+    Ok(conn.batch_execute(&query)?)
+}
+
+pub fn migration_count(conn: &PgConnection) -> Result<i64, StoreError> {
+    use __diesel_schema_migrations as m;
+
+    if !table_exists(conn, NAMESPACE_PUBLIC, &*MIGRATIONS_TABLE)? {
+        return Ok(0);
+    }
+
+    m::table.count().get_result(conn).map_err(StoreError::from)
 }
 
 pub fn account_like(conn: &PgConnection, site: &Site) -> Result<HashSet<String>, StoreError> {
@@ -303,7 +492,7 @@ pub(crate) mod table_schema {
                 _ => ci.data_type.clone(),
             };
             Self {
-                column_name: ci.column_name.clone(),
+                column_name: ci.column_name,
                 data_type,
             }
         }
@@ -413,4 +602,201 @@ pub(crate) fn check_index_is_valid(
         .map_err::<StoreError, _>(Into::into)?
         .map(|check| check.is_valid);
     Ok(matches!(result, Some(true)))
+}
+
+pub(crate) fn indexes_for_table(
+    conn: &PgConnection,
+    schema_name: &str,
+    table_name: &str,
+) -> Result<Vec<String>, StoreError> {
+    #[derive(Queryable, QueryableByName)]
+    struct IndexName {
+        #[sql_type = "Text"]
+        #[column_name = "indexdef"]
+        def: String,
+    }
+
+    let query = "
+        select
+            indexdef
+        from
+            pg_indexes
+        where
+            schemaname = $1
+            and tablename = $2
+        order by indexname";
+    let results = sql_query(query)
+        .bind::<Text, _>(schema_name)
+        .bind::<Text, _>(table_name)
+        .load::<IndexName>(conn)
+        .map_err::<StoreError, _>(Into::into)?;
+
+    Ok(results.into_iter().map(|i| i.def).collect())
+}
+pub(crate) fn drop_index(
+    conn: &PgConnection,
+    schema_name: &str,
+    index_name: &str,
+) -> Result<(), StoreError> {
+    let query = format!("drop index concurrently {schema_name}.{index_name}");
+    sql_query(&query)
+        .bind::<Text, _>(schema_name)
+        .bind::<Text, _>(index_name)
+        .execute(conn)
+        .map_err::<StoreError, _>(Into::into)?;
+    Ok(())
+}
+
+pub fn stats(conn: &PgConnection, namespace: &Namespace) -> Result<Vec<VersionStats>, StoreError> {
+    #[derive(Queryable, QueryableByName)]
+    pub struct DbStats {
+        #[sql_type = "Integer"]
+        pub entities: i32,
+        #[sql_type = "Integer"]
+        pub versions: i32,
+        #[sql_type = "Text"]
+        pub tablename: String,
+        /// The ratio `entities / versions`
+        #[sql_type = "Double"]
+        pub ratio: f64,
+    }
+
+    impl From<DbStats> for VersionStats {
+        fn from(s: DbStats) -> Self {
+            VersionStats {
+                entities: s.entities,
+                versions: s.versions,
+                tablename: s.tablename,
+                ratio: s.ratio,
+            }
+        }
+    }
+
+    // Get an estimate of number of rows (pg_class.reltuples) and number of
+    // distinct entities (based on the planners idea of how many distinct
+    // values there are in the `id` column) See the [Postgres
+    // docs](https://www.postgresql.org/docs/current/view-pg-stats.html) for
+    // the precise meaning of n_distinct
+    let query = format!(
+        "select case when s.n_distinct < 0 then (- s.n_distinct * c.reltuples)::int4
+                     else s.n_distinct::int4
+                 end as entities,
+                 c.reltuples::int4  as versions,
+                 c.relname as tablename,
+                case when c.reltuples = 0 then 0::float8
+                     when s.n_distinct < 0 then (-s.n_distinct)::float8
+                     else greatest(s.n_distinct, 1)::float8 / c.reltuples::float8
+                 end as ratio
+           from pg_namespace n, pg_class c, pg_stats s
+          where n.nspname = $1
+            and c.relnamespace = n.oid
+            and s.schemaname = n.nspname
+            and s.attname = 'id'
+            and c.relname = s.tablename
+          order by c.relname"
+    );
+
+    let stats = sql_query(query)
+        .bind::<Text, _>(namespace.as_str())
+        .load::<DbStats>(conn)
+        .map_err(StoreError::from)?;
+
+    Ok(stats.into_iter().map(|s| s.into()).collect())
+}
+
+/// Return by how much the slowest replica connected to the database `conn`
+/// is lagging. The returned value has millisecond precision. If the
+/// database has no replicas, return `0`
+pub(crate) fn replication_lag(conn: &PgConnection) -> Result<Duration, StoreError> {
+    #[derive(Queryable, QueryableByName)]
+    struct Lag {
+        #[sql_type = "Nullable<Integer>"]
+        ms: Option<i32>,
+    }
+
+    let lag = sql_query(
+        "select (extract(epoch from max(greatest(write_lag, flush_lag, replay_lag)))*1000)::int as ms \
+           from pg_stat_replication",
+    )
+    .get_result::<Lag>(conn)?;
+
+    let lag = lag
+        .ms
+        .map(|ms| if ms <= 0 { 0 } else { ms as u64 })
+        .unwrap_or(0);
+
+    Ok(Duration::from_millis(lag))
+}
+
+pub(crate) fn cancel_vacuum(conn: &PgConnection, namespace: &Namespace) -> Result<(), StoreError> {
+    sql_query(
+        "select pg_cancel_backend(v.pid) \
+           from pg_stat_progress_vacuum v, \
+                pg_class c, \
+                pg_namespace n \
+          where v.relid = c.oid \
+            and c.relnamespace = n.oid \
+            and n.nspname = $1",
+    )
+    .bind::<Text, _>(namespace)
+    .execute(conn)?;
+    Ok(())
+}
+
+pub(crate) fn default_stats_target(conn: &PgConnection) -> Result<i32, StoreError> {
+    #[derive(Queryable, QueryableByName)]
+    struct Target {
+        #[sql_type = "Integer"]
+        setting: i32,
+    }
+
+    let target =
+        sql_query("select setting::int from pg_settings where name = 'default_statistics_target'")
+            .get_result::<Target>(conn)?;
+    Ok(target.setting)
+}
+
+pub(crate) fn stats_targets(
+    conn: &PgConnection,
+    namespace: &Namespace,
+) -> Result<BTreeMap<SqlName, BTreeMap<SqlName, i32>>, StoreError> {
+    use pg_attribute as a;
+    use pg_class as c;
+    use pg_namespace as n;
+
+    let targets = c::table
+        .inner_join(n::table)
+        .inner_join(a::table)
+        .filter(c::kind.eq("r"))
+        .filter(n::name.eq(namespace.as_str()))
+        .filter(a::num.ge(1))
+        .select((c::name, a::name, a::stats_target))
+        .load::<(String, String, i32)>(conn)?
+        .into_iter()
+        .map(|(table, column, target)| (SqlName::from(table), SqlName::from(column), target));
+
+    let map = targets.into_iter().fold(
+        BTreeMap::<SqlName, BTreeMap<SqlName, i32>>::new(),
+        |mut map, (table, column, target)| {
+            map.entry(table).or_default().insert(column, target);
+            map
+        },
+    );
+    Ok(map)
+}
+
+pub(crate) fn set_stats_target(
+    conn: &PgConnection,
+    namespace: &Namespace,
+    table: &SqlName,
+    columns: &[&SqlName],
+    target: i32,
+) -> Result<(), StoreError> {
+    let columns = columns
+        .iter()
+        .map(|column| format!("alter column {} set statistics {}", column.quoted(), target))
+        .join(", ");
+    let query = format!("alter table {}.{} {}", namespace, table.quoted(), columns);
+    conn.batch_execute(&query)?;
+    Ok(())
 }

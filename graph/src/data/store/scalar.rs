@@ -4,13 +4,12 @@ use diesel_derives::{AsExpression, FromSqlRow};
 use hex;
 use num_bigint;
 use serde::{self, Deserialize, Serialize};
+use stable_hash::utils::AsInt;
+use stable_hash::{FieldAddress, StableHash};
+use stable_hash_legacy::SequenceNumber;
 use thiserror::Error;
 use web3::types::*;
 
-use stable_hash::{
-    prelude::*,
-    utils::{AsBytes, AsInt},
-};
 use std::convert::{TryFrom, TryInto};
 use std::fmt::{self, Display, Formatter};
 use std::io::Write;
@@ -20,13 +19,14 @@ use std::str::FromStr;
 pub use num_bigint::Sign as BigIntSign;
 
 use crate::blockchain::BlockHash;
+use crate::util::stable_hash_glue::{impl_stable_hash, AsBytes};
 
 /// All operations on `BigDecimal` return a normalized value.
 // Caveat: The exponent is currently an i64 and may overflow. See
 // https://github.com/akubera/bigdecimal-rs/issues/54.
 // Using `#[serde(from = "BigDecimal"]` makes sure deserialization calls `BigDecimal::new()`.
 #[derive(
-    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, AsExpression, FromSqlRow,
+    Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, AsExpression, FromSqlRow,
 )]
 #[serde(from = "bigdecimal::BigDecimal")]
 #[sql_type = "diesel::sql_types::Numeric"]
@@ -48,6 +48,10 @@ impl BigDecimal {
     pub fn new(digits: BigInt, exp: i64) -> Self {
         // bigdecimal uses `scale` as the opposite of the power of ten, so negate `exp`.
         Self::from(bigdecimal::BigDecimal::new(digits.0, -exp))
+    }
+
+    pub fn parse_bytes(bytes: &[u8]) -> Option<Self> {
+        bigdecimal::BigDecimal::parse_bytes(bytes, 10).map(Self)
     }
 
     pub fn zero() -> BigDecimal {
@@ -82,13 +86,19 @@ impl BigDecimal {
         let int_val = num_bigint::BigInt::from_radix_be(sign, &digits, 10).unwrap();
         let scale = exp - trailing_count as i64;
 
-        BigDecimal(bigdecimal::BigDecimal::new(int_val.into(), scale))
+        BigDecimal(bigdecimal::BigDecimal::new(int_val, scale))
     }
 }
 
 impl Display for BigDecimal {
     fn fmt(&self, f: &mut Formatter) -> Result<(), fmt::Error> {
         self.0.fmt(f)
+    }
+}
+
+impl fmt::Debug for BigDecimal {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "BigDecimal({})", self.0)
     }
 }
 
@@ -187,27 +197,61 @@ impl bigdecimal::ToPrimitive for BigDecimal {
     }
 }
 
-impl StableHash for BigDecimal {
-    fn stable_hash<H: StableHasher>(&self, mut sequence_number: H::Seq, state: &mut H) {
+impl stable_hash_legacy::StableHash for BigDecimal {
+    fn stable_hash<H: stable_hash_legacy::StableHasher>(
+        &self,
+        mut sequence_number: H::Seq,
+        state: &mut H,
+    ) {
         let (int, exp) = self.as_bigint_and_exponent();
         // This only allows for backward compatible changes between
         // BigDecimal and unsigned ints
-        exp.stable_hash(sequence_number.next_child(), state);
-        BigInt(int).stable_hash(sequence_number, state);
+        stable_hash_legacy::StableHash::stable_hash(&exp, sequence_number.next_child(), state);
+        stable_hash_legacy::StableHash::stable_hash(&BigInt(int), sequence_number, state);
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+impl StableHash for BigDecimal {
+    fn stable_hash<H: stable_hash::StableHasher>(&self, field_address: H::Addr, state: &mut H) {
+        // This implementation allows for backward compatible changes from integers (signed or unsigned)
+        // when the exponent is zero.
+        let (int, exp) = self.as_bigint_and_exponent();
+        StableHash::stable_hash(&exp, field_address.child(1), state);
+        // Normally it would be a red flag to pass field_address in after having used a child slot.
+        // But, we know the implementation of StableHash for BigInt will not use child(1) and that
+        // it will not in the future due to having no forward schema evolutions for ints and the
+        // stability guarantee.
+        //
+        // For reference, ints use child(0) for the sign and write the little endian bytes to the parent slot.
+        BigInt(int).stable_hash(field_address, state);
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct BigInt(num_bigint::BigInt);
 
-impl StableHash for BigInt {
+impl stable_hash_legacy::StableHash for BigInt {
     #[inline]
-    fn stable_hash<H: StableHasher>(&self, sequence_number: H::Seq, state: &mut H) {
-        AsInt {
+    fn stable_hash<H: stable_hash_legacy::StableHasher>(
+        &self,
+        sequence_number: H::Seq,
+        state: &mut H,
+    ) {
+        stable_hash_legacy::utils::AsInt {
             is_negative: self.0.sign() == BigIntSign::Minus,
             little_endian: &self.to_bytes_le().1,
         }
         .stable_hash(sequence_number, state)
+    }
+}
+
+impl StableHash for BigInt {
+    fn stable_hash<H: stable_hash::StableHasher>(&self, field_address: H::Addr, state: &mut H) {
+        AsInt {
+            is_negative: self.0.sign() == BigIntSign::Minus,
+            little_endian: &self.to_bytes_le().1,
+        }
+        .stable_hash(field_address, state)
     }
 }
 
@@ -236,7 +280,7 @@ impl<'a> TryFrom<&'a BigInt> for u64 {
         let mut n = 0u64;
         let mut shift_dist = 0;
         for b in bytes {
-            n = ((b as u64) << shift_dist) | n;
+            n |= (b as u64) << shift_dist;
             shift_dist += 8;
         }
         Ok(n)
@@ -250,6 +294,12 @@ impl TryFrom<BigInt> for u64 {
     }
 }
 
+impl fmt::Debug for BigInt {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "BigInt({})", self)
+    }
+}
+
 impl BigInt {
     pub fn from_unsigned_bytes_le(bytes: &[u8]) -> Self {
         BigInt(num_bigint::BigInt::from_bytes_le(
@@ -260,6 +310,10 @@ impl BigInt {
 
     pub fn from_signed_bytes_le(bytes: &[u8]) -> Self {
         BigInt(num_bigint::BigInt::from_signed_bytes_le(bytes))
+    }
+
+    pub fn from_signed_bytes_be(bytes: &[u8]) -> Self {
+        BigInt(num_bigint::BigInt::from_signed_bytes_be(bytes))
     }
 
     pub fn to_bytes_le(&self) -> (BigIntSign, Vec<u8>) {
@@ -481,7 +535,7 @@ impl Shr<u8> for BigInt {
 }
 
 /// A byte array that's serialized as a hex string prefixed by `0x`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Bytes(Box<[u8]>);
 
 impl Deref for Bytes {
@@ -491,11 +545,13 @@ impl Deref for Bytes {
     }
 }
 
-impl StableHash for Bytes {
-    fn stable_hash<H: StableHasher>(&self, sequence_number: H::Seq, state: &mut H) {
-        AsBytes(&self.0).stable_hash(sequence_number, state);
+impl fmt::Debug for Bytes {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "Bytes(0x{})", hex::encode(&self.0))
     }
 }
+
+impl_stable_hash!(Bytes(transparent: AsBytes));
 
 impl Bytes {
     pub fn as_slice(&self) -> &[u8] {
@@ -556,12 +612,24 @@ impl<'de> Deserialize<'de> for Bytes {
     }
 }
 
+impl<const N: usize> From<[u8; N]> for Bytes {
+    fn from(array: [u8; N]) -> Bytes {
+        Bytes(array.into())
+    }
+}
+
+impl From<Vec<u8>> for Bytes {
+    fn from(vec: Vec<u8>) -> Self {
+        Bytes(vec.into())
+    }
+}
+
 #[cfg(test)]
 mod test {
-    use super::{BigDecimal, BigInt};
-    use stable_hash::crypto::SetHasher;
-    use stable_hash::prelude::*;
-    use stable_hash::utils::stable_hash;
+    use super::{BigDecimal, BigInt, Bytes};
+    use stable_hash_legacy::crypto::SetHasher;
+    use stable_hash_legacy::prelude::*;
+    use stable_hash_legacy::utils::stable_hash;
     use std::str::FromStr;
     use web3::types::U64;
 
@@ -657,5 +725,15 @@ mod test {
             assert_eq!(not_normalized.normalized().to_string(), string);
             assert_eq!(normalized.to_string(), string);
         }
+    }
+
+    #[test]
+    fn fmt_debug() {
+        let bi = BigInt::from(-17);
+        let bd = BigDecimal::new(bi.clone(), -2);
+        let bytes = Bytes::from([222, 173, 190, 239].as_slice());
+        assert_eq!("BigInt(-17)", format!("{:?}", bi));
+        assert_eq!("BigDecimal(-0.17)", format!("{:?}", bd));
+        assert_eq!("Bytes(0xdeadbeef)", format!("{:?}", bytes));
     }
 }

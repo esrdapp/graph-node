@@ -1,11 +1,11 @@
 use std::convert::TryFrom;
-use std::fmt;
 use std::pin::Pin;
 use std::task::Context;
 use std::task::Poll;
 use std::time::Instant;
 
 use graph::prelude::*;
+use graph::semver::VersionReq;
 use graph::{components::server::query::GraphQLServerError, data::query::QueryTarget};
 use http::header;
 use http::header::{
@@ -15,57 +15,7 @@ use http::header::{
 use hyper::service::Service;
 use hyper::{Body, Method, Request, Response, StatusCode};
 
-use crate::request::GraphQLRequest;
-
-pub struct GraphQLServiceMetrics {
-    query_execution_time: Box<HistogramVec>,
-    failed_query_execution_time: Box<HistogramVec>,
-}
-
-impl fmt::Debug for GraphQLServiceMetrics {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "GraphQLServiceMetrics {{ }}")
-    }
-}
-
-impl GraphQLServiceMetrics {
-    pub fn new(registry: Arc<impl MetricsRegistry>) -> Self {
-        let query_execution_time = registry
-            .new_histogram_vec(
-                "query_execution_time",
-                "Execution time for successful GraphQL queries",
-                vec![String::from("deployment")],
-                vec![0.1, 0.5, 1.0, 10.0, 100.0],
-            )
-            .expect("failed to create `query_execution_time` histogram");
-
-        let failed_query_execution_time = registry
-            .new_histogram_vec(
-                "query_failed_execution_time",
-                "Execution time for failed GraphQL queries",
-                vec![String::from("deployment")],
-                vec![0.1, 0.5, 1.0, 10.0, 100.0],
-            )
-            .expect("failed to create `query_failed_execution_time` histogram");
-
-        Self {
-            query_execution_time,
-            failed_query_execution_time,
-        }
-    }
-
-    pub fn observe_query_execution_time(&self, duration: f64, deployment_id: String) {
-        self.query_execution_time
-            .with_label_values(vec![deployment_id.as_ref()].as_slice())
-            .observe(duration);
-    }
-
-    pub fn observe_failed_query_execution_time(&self, duration: f64, deployment_id: String) {
-        self.failed_query_execution_time
-            .with_label_values(vec![deployment_id.as_ref()].as_slice())
-            .observe(duration);
-    }
-}
+use crate::request::parse_graphql_request;
 
 pub type GraphQLServiceResult = Result<Response<Body>, GraphQLServerError>;
 /// An asynchronous response to a GraphQL request.
@@ -76,7 +26,6 @@ pub type GraphQLServiceResponse =
 #[derive(Debug)]
 pub struct GraphQLService<Q> {
     logger: Logger,
-    metrics: Arc<GraphQLServiceMetrics>,
     graphql_runner: Arc<Q>,
     ws_port: u16,
     node_id: NodeId,
@@ -86,7 +35,6 @@ impl<Q> Clone for GraphQLService<Q> {
     fn clone(&self) -> Self {
         Self {
             logger: self.logger.clone(),
-            metrics: self.metrics.clone(),
             graphql_runner: self.graphql_runner.clone(),
             ws_port: self.ws_port,
             node_id: self.node_id.clone(),
@@ -99,16 +47,9 @@ where
     Q: GraphQlRunner,
 {
     /// Creates a new GraphQL service.
-    pub fn new(
-        logger: Logger,
-        metrics: Arc<GraphQLServiceMetrics>,
-        graphql_runner: Arc<Q>,
-        ws_port: u16,
-        node_id: NodeId,
-    ) -> Self {
+    pub fn new(logger: Logger, graphql_runner: Arc<Q>, ws_port: u16, node_id: NodeId) -> Self {
         GraphQLService {
             logger,
-            metrics,
             graphql_runner,
             ws_port,
             node_id,
@@ -132,23 +73,6 @@ where
             .unwrap())
     }
 
-    /// Serves a static file.
-    fn serve_file(
-        &self,
-        contents: &'static str,
-        content_type: &'static str,
-    ) -> GraphQLServiceResponse {
-        async move {
-            Ok(Response::builder()
-                .status(200)
-                .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                .header(CONTENT_TYPE, content_type)
-                .body(Body::from(contents))
-                .unwrap())
-        }
-        .boxed()
-    }
-
     /// Serves a dynamically created file.
     fn serve_dynamic_file(&self, contents: String) -> GraphQLServiceResponse {
         async {
@@ -166,16 +90,45 @@ where
         self.serve_dynamic_file(self.graphiql_html())
     }
 
+    fn resolve_api_version(
+        &self,
+        request: &Request<Body>,
+    ) -> Result<ApiVersion, GraphQLServerError> {
+        let mut version = ApiVersion::default();
+
+        if let Some(query) = request.uri().query() {
+            let potential_version_requirement = query.split('&').find_map(|pair| {
+                if pair.starts_with("api-version=") {
+                    if let Some(version_requirement) = pair.split('=').nth(1) {
+                        return Some(version_requirement);
+                    }
+                }
+                None
+            });
+
+            if let Some(version_requirement) = potential_version_requirement {
+                version = ApiVersion::new(
+                    &VersionReq::parse(version_requirement)
+                        .map_err(|error| GraphQLServerError::ClientError(error.to_string()))?,
+                )
+                .map_err(GraphQLServerError::ClientError)?;
+            }
+        }
+
+        Ok(version)
+    }
+
     async fn handle_graphql_query_by_name(
         self,
         subgraph_name: String,
         request: Request<Body>,
     ) -> GraphQLServiceResult {
+        let version = self.resolve_api_version(&request)?;
         let subgraph_name = SubgraphName::new(subgraph_name.as_str()).map_err(|()| {
             GraphQLServerError::ClientError(format!("Invalid subgraph name {:?}", subgraph_name))
         })?;
 
-        self.handle_graphql_query(subgraph_name.into(), request.into_body())
+        self.handle_graphql_query(QueryTarget::Name(subgraph_name, version), request)
             .await
     }
 
@@ -185,11 +138,16 @@ where
         request: Request<Body>,
     ) -> GraphQLServiceResponse {
         let res = DeploymentHash::new(id)
-            .map_err(|id| GraphQLServerError::ClientError(format!("Invalid subgraph id `{}`", id)));
+            .map_err(|id| GraphQLServerError::ClientError(format!("Invalid subgraph id `{}`", id)))
+            .and_then(|id| match self.resolve_api_version(&request) {
+                Ok(version) => Ok((id, version)),
+                Err(error) => Err(error),
+            });
+
         match res {
             Err(_) => self.handle_not_found(),
-            Ok(id) => self
-                .handle_graphql_query(id.into(), request.into_body())
+            Ok((id, version)) => self
+                .handle_graphql_query(QueryTarget::Deployment(id, version), request)
                 .boxed(),
         }
     }
@@ -197,16 +155,28 @@ where
     async fn handle_graphql_query(
         self,
         target: QueryTarget,
-        request_body: Body,
+        request: Request<Body>,
     ) -> GraphQLServiceResult {
         let service = self.clone();
-        let service_metrics = self.metrics.clone();
 
         let start = Instant::now();
-        let body = hyper::body::to_bytes(request_body)
+        let trace = {
+            !ENV_VARS.graphql.query_trace_token.is_empty()
+                && request
+                    .headers()
+                    .get("X-GraphTraceQuery")
+                    .map(|v| {
+                        v.to_str()
+                            .map(|s| s == &ENV_VARS.graphql.query_trace_token)
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false)
+        };
+        let body = hyper::body::to_bytes(request.into_body())
             .map_err(|_| GraphQLServerError::InternalError("Failed to read request body".into()))
             .await?;
-        let query = GraphQLRequest::new(body).compat().await;
+        let query = parse_graphql_request(&body, trace);
+        let query_parsing_time = start.elapsed();
 
         let result = match query {
             Ok(query) => service.graphql_runner.run_query(query, target).await,
@@ -214,10 +184,12 @@ where
             Err(e) => return Err(e),
         };
 
-        if let Some(id) = result.first().and_then(|res| res.deployment.clone()) {
-            service_metrics
-                .observe_query_execution_time(start.elapsed().as_secs_f64(), id.to_string());
-        }
+        self.graphql_runner
+            .metrics()
+            .observe_query_parsing(query_parsing_time, &result);
+        self.graphql_runner
+            .metrics()
+            .observe_query_execution(start.elapsed(), &result);
 
         Ok(result.as_http_response())
     }
@@ -282,13 +254,6 @@ where
 
         match (method, path_segments.as_slice()) {
             (Method::GET, [""]) => self.index().boxed(),
-            (Method::GET, ["graphiql.css"]) => {
-                self.serve_file(include_str!("../assets/graphiql.css"), "text/css")
-            }
-            (Method::GET, ["graphiql.min.js"]) => {
-                self.serve_file(include_str!("../assets/graphiql.min.js"), "text/javascript")
-            }
-
             (Method::GET, &["subgraphs", "id", _, "graphql"])
             | (Method::GET, &["subgraphs", "name", _, "graphql"])
             | (Method::GET, &["subgraphs", "name", _, _, "graphql"])
@@ -298,8 +263,7 @@ where
             (Method::GET, path @ ["subgraphs", "id", _])
             | (Method::GET, path @ ["subgraphs", "name", _])
             | (Method::GET, path @ ["subgraphs", "name", _, _])
-            | (Method::GET, path @ ["subgraphs", "network", _, _])
-            | (Method::GET, path @ ["subgraphs"]) => {
+            | (Method::GET, path @ ["subgraphs", "network", _, _]) => {
                 let dest = format!("/{}/graphql", path.join("/"));
                 self.handle_temp_redirect(dest).boxed()
             }
@@ -397,18 +361,25 @@ mod tests {
         query::{QueryResults, QueryTarget},
     };
     use graph::prelude::*;
-    use graph_mock::MockMetricsRegistry;
 
     use crate::test_utils;
 
     use super::GraphQLService;
-    use super::GraphQLServiceMetrics;
 
     /// A simple stupid query runner for testing.
     pub struct TestGraphQlRunner;
 
+    pub struct TestGraphQLMetrics;
+
     lazy_static! {
         static ref USERS: DeploymentHash = DeploymentHash::new("users").unwrap();
+    }
+
+    impl GraphQLMetrics for TestGraphQLMetrics {
+        fn observe_query_execution(&self, _duration: Duration, _results: &QueryResults) {}
+        fn observe_query_parsing(&self, _duration: Duration, _results: &QueryResults) {}
+        fn observe_query_validation(&self, _duration: Duration, _id: &DeploymentHash) {}
+        fn observe_query_validation_error(&self, _error_codes: Vec<&str>, _id: &DeploymentHash) {}
     }
 
     #[async_trait]
@@ -446,18 +417,20 @@ mod tests {
         fn load_manager(&self) -> Arc<LoadManager> {
             unimplemented!()
         }
+
+        fn metrics(&self) -> Arc<dyn GraphQLMetrics> {
+            Arc::new(TestGraphQLMetrics)
+        }
     }
 
     #[test]
     fn posting_invalid_query_yields_error_response() {
         let logger = Logger::root(slog::Discard, o!());
-        let metrics_registry = Arc::new(MockMetricsRegistry::new());
-        let metrics = Arc::new(GraphQLServiceMetrics::new(metrics_registry));
         let subgraph_id = USERS.clone();
         let graphql_runner = Arc::new(TestGraphQlRunner);
 
         let node_id = NodeId::new("test").unwrap();
-        let mut service = GraphQLService::new(logger, metrics, graphql_runner, 8001, node_id);
+        let mut service = GraphQLService::new(logger, graphql_runner, 8001, node_id);
 
         let request = Request::builder()
             .method(Method::POST)
@@ -483,13 +456,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn posting_valid_queries_yields_result_response() {
         let logger = Logger::root(slog::Discard, o!());
-        let metrics_registry = Arc::new(MockMetricsRegistry::new());
-        let metrics = Arc::new(GraphQLServiceMetrics::new(metrics_registry));
         let subgraph_id = USERS.clone();
         let graphql_runner = Arc::new(TestGraphQlRunner);
 
         let node_id = NodeId::new("test").unwrap();
-        let mut service = GraphQLService::new(logger, metrics, graphql_runner, 8001, node_id);
+        let mut service = GraphQLService::new(logger, graphql_runner, 8001, node_id);
 
         let request = Request::builder()
             .method(Method::POST)

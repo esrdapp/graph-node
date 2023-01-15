@@ -1,8 +1,10 @@
+use crate::env::ENV_VARS;
 use crate::prelude::CacheWeight;
 use priority_queue::PriorityQueue;
 use std::cmp::Reverse;
 use std::fmt::Debug;
 use std::hash::{Hash, Hasher};
+use std::time::{Duration, Instant};
 
 // The number of `evict` calls without access after which an entry is considered stale.
 const STALE_PERIOD: u64 = 100;
@@ -43,15 +45,34 @@ impl<K, V: Default + CacheWeight> CacheEntry<K, V> {
 }
 
 impl<K: CacheWeight, V: Default + CacheWeight> CacheEntry<K, V> {
-    /// Estimate the size of a `CacheEntry` with the given key and value
+    /// Estimate the size of a `CacheEntry` with the given key and value. Do
+    /// not count the size of `Self` since that is memory that is not freed
+    /// when the cache entry is dropped as its storage is embedded in the
+    /// `PriorityQueue`
     fn weight(key: &K, value: &V) -> usize {
-        value.indirect_weight() + key.indirect_weight() + std::mem::size_of::<Self>()
+        value.indirect_weight() + key.indirect_weight()
     }
 }
 
 // The priorities are `(stale, frequency)` tuples, first all stale entries will be popped and
 // then non-stale entries by least frequency.
 type Priority = (bool, Reverse<u64>);
+
+/// Statistics about what happened during cache eviction
+pub struct EvictStats {
+    /// The weight of the cache after eviction
+    pub new_weight: usize,
+    /// The weight of the items that were evicted
+    pub evicted_weight: usize,
+    /// The number of entries after eviction
+    pub new_count: usize,
+    /// The number if entries that were evicted
+    pub evicted_count: usize,
+    /// Whether we updated the stale status of entries
+    pub stale_update: bool,
+    /// How long eviction took
+    pub evict_time: Duration,
+}
 
 /// Each entry in the cache has a frequency, which is incremented by 1 on access. Entries also have
 /// a weight, upon eviction first stale entries will be removed and then non-stale entries by order
@@ -63,6 +84,7 @@ pub struct LfuCache<K: Eq + Hash, V> {
     queue: PriorityQueue<CacheEntry<K, V>, Priority>,
     total_weight: usize,
     stale_counter: u64,
+    dead_weight: bool,
 }
 
 impl<K: Ord + Eq + Hash, V> Default for LfuCache<K, V> {
@@ -71,6 +93,7 @@ impl<K: Ord + Eq + Hash, V> Default for LfuCache<K, V> {
             queue: PriorityQueue::new(),
             total_weight: 0,
             stale_counter: 0,
+            dead_weight: false,
         }
     }
 }
@@ -81,6 +104,7 @@ impl<K: Clone + Ord + Eq + Hash + Debug + CacheWeight, V: CacheWeight + Default>
             queue: PriorityQueue::new(),
             total_weight: 0,
             stale_counter: 0,
+            dead_weight: ENV_VARS.mappings.entity_cache_dead_weight,
         }
     }
 
@@ -164,7 +188,7 @@ impl<K: Clone + Ord + Eq + Hash + Debug + CacheWeight, V: CacheWeight + Default>
     }
 
     /// Same as `evict_with_period(max_weight, STALE_PERIOD)`
-    pub fn evict(&mut self, max_weight: usize) -> Option<(usize, usize, usize)> {
+    pub fn evict(&mut self, max_weight: usize) -> Option<EvictStats> {
         self.evict_with_period(max_weight, STALE_PERIOD)
     }
 
@@ -180,10 +204,12 @@ impl<K: Clone + Ord + Eq + Hash + Debug + CacheWeight, V: CacheWeight + Default>
         &mut self,
         max_weight: usize,
         stale_period: u64,
-    ) -> Option<(usize, usize, usize)> {
+    ) -> Option<EvictStats> {
         if self.total_weight <= max_weight {
             return None;
         }
+
+        let start = Instant::now();
 
         self.stale_counter += 1;
         if self.stale_counter == stale_period {
@@ -200,8 +226,13 @@ impl<K: Clone + Ord + Eq + Hash + Debug + CacheWeight, V: CacheWeight + Default>
         }
 
         let mut evicted = 0;
-        let old_weight = self.total_weight;
-        while self.total_weight > max_weight {
+        let old_len = self.len();
+        let dead_weight = if self.dead_weight {
+            self.len() * (std::mem::size_of::<CacheEntry<K, V>>() + 40)
+        } else {
+            0
+        };
+        while self.total_weight + dead_weight > max_weight {
             let entry = self
                 .queue
                 .pop()
@@ -210,7 +241,14 @@ impl<K: Clone + Ord + Eq + Hash + Debug + CacheWeight, V: CacheWeight + Default>
             evicted += entry.weight;
             self.total_weight -= entry.weight;
         }
-        Some((evicted, old_weight, self.total_weight))
+        Some(EvictStats {
+            new_weight: self.total_weight,
+            evicted_weight: evicted,
+            new_count: self.len(),
+            evicted_count: old_len - self.len(),
+            stale_update: self.stale_counter == 0,
+            evict_time: start.elapsed(),
+        })
     }
 }
 

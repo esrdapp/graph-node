@@ -4,6 +4,7 @@ extern crate pretty_assertions;
 use std::sync::Arc;
 
 use graph::data::graphql::{object, object_value, ObjectOrInterface};
+use graph::data::query::Trace;
 use graph::prelude::{
     async_trait, o, r, s, slog, tokio, ApiSchema, DeploymentHash, Logger, Query,
     QueryExecutionError, QueryResult, Schema,
@@ -12,6 +13,7 @@ use graph_graphql::prelude::{
     a, api_schema, execute_query, ExecutionContext, Query as PreparedQuery, QueryExecutionOptions,
     Resolver,
 };
+use test_store::graphql_metrics;
 use test_store::LOAD_MANAGER;
 
 /// Mock resolver used in tests that don't need a resolver.
@@ -26,11 +28,11 @@ impl Resolver for MockResolver {
         &self,
         _: &ExecutionContext<Self>,
         _: &a::SelectionSet,
-    ) -> Result<Option<r::Value>, Vec<QueryExecutionError>> {
-        Ok(None)
+    ) -> Result<(Option<r::Value>, Trace), Vec<QueryExecutionError>> {
+        Ok((None, Trace::None))
     }
 
-    fn resolve_objects<'a>(
+    async fn resolve_objects(
         &self,
         _: Option<r::Value>,
         _field: &a::Field,
@@ -40,7 +42,7 @@ impl Resolver for MockResolver {
         Ok(r::Value::Null)
     }
 
-    fn resolve_object(
+    async fn resolve_object(
         &self,
         __: Option<r::Value>,
         _field: &a::Field,
@@ -50,11 +52,11 @@ impl Resolver for MockResolver {
         Ok(r::Value::Null)
     }
 
-    async fn query_permit(&self) -> tokio::sync::OwnedSemaphorePermit {
-        Arc::new(tokio::sync::Semaphore::new(1))
+    async fn query_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, QueryExecutionError> {
+        Ok(Arc::new(tokio::sync::Semaphore::new(1))
             .acquire_owned()
             .await
-            .unwrap()
+            .unwrap())
     }
 }
 
@@ -558,6 +560,7 @@ async fn introspection_query(schema: Schema, query: &str) -> QueryResult {
     let query = Query::new(
         graphql_parser::parse_query(query).unwrap().into_static(),
         None,
+        false,
     );
 
     // Execute it
@@ -568,13 +571,17 @@ async fn introspection_query(schema: Schema, query: &str) -> QueryResult {
         max_first: std::u32::MAX,
         max_skip: std::u32::MAX,
         load_manager: LOAD_MANAGER.clone(),
+        trace: false,
     };
 
     let schema = Arc::new(ApiSchema::from_api_schema(schema).unwrap());
-    let result = match PreparedQuery::new(&logger, schema, None, query, None, 100) {
-        Ok(query) => Ok(Arc::try_unwrap(execute_query(query, None, None, options).await).unwrap()),
-        Err(e) => Err(e),
-    };
+    let result =
+        match PreparedQuery::new(&logger, schema, None, query, None, 100, graphql_metrics()) {
+            Ok(query) => {
+                Ok(Arc::try_unwrap(execute_query(query, None, None, options).await).unwrap())
+            }
+            Err(e) => Err(e),
+        };
     QueryResult::from(result)
 }
 

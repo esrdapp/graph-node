@@ -2,33 +2,34 @@ use diesel::{self, PgConnection};
 use graph::data::graphql::effort::LoadManager;
 use graph::data::query::QueryResults;
 use graph::data::query::QueryTarget;
-use graph::data::subgraph::schema::SubgraphError;
+use graph::data::subgraph::schema::{DeploymentCreate, SubgraphError};
 use graph::log;
 use graph::prelude::{QueryStoreManager as _, SubgraphStore as _, *};
 use graph::semver::Version;
 use graph::{
-    blockchain::ChainIdentifier, components::store::DeploymentLocator,
+    blockchain::block_stream::FirehoseCursor, blockchain::ChainIdentifier,
+    components::store::DeploymentLocator, components::store::EntityKey,
     components::store::EntityType, components::store::StatusStore,
     components::store::StoredDynamicDataSource, data::subgraph::status, prelude::NodeId,
 };
 use graph_graphql::prelude::{
     execute_query, Query as PreparedQuery, QueryExecutionOptions, StoreResolver,
 };
-use graph_graphql::test_support::ResultSizeMetrics;
+use graph_graphql::test_support::GraphQLMetrics;
 use graph_mock::MockMetricsRegistry;
 use graph_node::config::{Config, Opt};
 use graph_node::store_builder::StoreBuilder;
 use graph_store_postgres::layout_for_tests::FAKE_NETWORK_SHARED;
 use graph_store_postgres::{connection_pool::ConnectionPool, Shard, SubscriptionManager};
 use graph_store_postgres::{
-    BlockStore as DieselBlcokStore, DeploymentPlacer, SubgraphStore as DieselSubgraphStore,
+    BlockStore as DieselBlockStore, DeploymentPlacer, SubgraphStore as DieselSubgraphStore,
     PRIMARY_SHARD,
 };
 use hex_literal::hex;
 use lazy_static::lazy_static;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::time::Instant;
-use std::{collections::BTreeSet, env};
 use std::{marker::PhantomData, sync::Mutex};
 use tokio::runtime::{Builder, Runtime};
 use web3::types::H256;
@@ -41,7 +42,7 @@ pub use graph_store_postgres::Store;
 const CONN_POOL_SIZE: u32 = 20;
 
 lazy_static! {
-    pub static ref LOGGER: Logger = match env::var_os("GRAPH_LOG") {
+    pub static ref LOGGER: Logger = match ENV_VARS.log_levels {
         Some(_) => log::logger(false),
         None => Logger::root(slog::Discard, o!()),
     };
@@ -62,8 +63,8 @@ lazy_static! {
     static ref CONFIG: Config = STORE_POOL_CONFIG.2.clone();
     pub static ref SUBSCRIPTION_MANAGER: Arc<SubscriptionManager> = STORE_POOL_CONFIG.3.clone();
     pub static ref NODE_ID: NodeId = NodeId::new("test").unwrap();
-    static ref SUBGRAPH_STORE: Arc<DieselSubgraphStore> = STORE.subgraph_store();
-    static ref BLOCK_STORE: Arc<DieselBlcokStore> = STORE.block_store();
+    pub static ref SUBGRAPH_STORE: Arc<DieselSubgraphStore> = STORE.subgraph_store();
+    static ref BLOCK_STORE: Arc<DieselBlockStore> = STORE.block_store();
     pub static ref GENESIS_PTR: BlockPtr = (
         H256::from(hex!(
             "bd34884280958002c51d3f7b5f853e6febeba33de0f40d15b0363006533c924f"
@@ -121,7 +122,7 @@ where
 /// Run a test with a connection into the primary database, not a full store
 pub fn run_test_with_conn<F>(test: F)
 where
-    F: FnOnce(&PgConnection) -> (),
+    F: FnOnce(&PgConnection),
 {
     // Lock regardless of poisoning. This also forces sequential test execution.
     let _lock = match SEQ_LOCK.lock() {
@@ -146,14 +147,14 @@ pub fn place(name: &str) -> Result<Option<(Vec<Shard>, Vec<NodeId>)>, String> {
     CONFIG.deployment.place(name, NETWORK_NAME)
 }
 
-pub fn create_subgraph(
+pub async fn create_subgraph(
     subgraph_id: &DeploymentHash,
     schema: &str,
     base: Option<(DeploymentHash, BlockPtr)>,
 ) -> Result<DeploymentLocator, StoreError> {
     let schema = Schema::parse(schema, subgraph_id.clone()).unwrap();
 
-    let manifest = SubgraphManifest::<graph_chain_ethereum::Chain> {
+    let manifest = SubgraphManifest::<graph::blockchain::mock::MockBlockchain> {
         id: subgraph_id.clone(),
         spec_version: Version::new(1, 0, 0),
         features: BTreeSet::new(),
@@ -166,7 +167,10 @@ pub fn create_subgraph(
         chain: PhantomData,
     };
 
-    let deployment = SubgraphDeploymentEntity::new(&manifest, false, None).graft(base);
+    let mut yaml = serde_yaml::Mapping::new();
+    yaml.insert("dataSources".into(), Vec::<serde_yaml::Value>::new().into());
+    let yaml = serde_yaml::to_string(&yaml).unwrap();
+    let deployment = DeploymentCreate::new(yaml, &manifest, None).graft(base);
     let name = {
         let mut name = subgraph_id.to_string();
         name.truncate(32);
@@ -180,17 +184,18 @@ pub fn create_subgraph(
         NETWORK_NAME.to_string(),
         SubgraphVersionSwitchingMode::Instant,
     )?;
-    futures03::executor::block_on(
-        SUBGRAPH_STORE
-            .cheap_clone()
-            .writable(LOGGER.clone(), deployment.id),
-    )?
-    .start_subgraph_deployment(&*LOGGER)?;
+
+    SUBGRAPH_STORE
+        .cheap_clone()
+        .writable(LOGGER.clone(), deployment.id)
+        .await?
+        .start_subgraph_deployment(&*LOGGER)
+        .await?;
     Ok(deployment)
 }
 
-pub fn create_test_subgraph(subgraph_id: &DeploymentHash, schema: &str) -> DeploymentLocator {
-    create_subgraph(subgraph_id, schema, None).unwrap()
+pub async fn create_test_subgraph(subgraph_id: &DeploymentHash, schema: &str) -> DeploymentLocator {
+    create_subgraph(subgraph_id, schema, None).await.unwrap()
 }
 
 pub fn remove_subgraph(id: &DeploymentHash) {
@@ -205,6 +210,7 @@ pub fn remove_subgraph(id: &DeploymentHash) {
     }
 }
 
+/// Transact errors for this block and wait until changes have been written
 pub async fn transact_errors(
     store: &Arc<Store>,
     deployment: &DeploymentLocator,
@@ -215,42 +221,75 @@ pub async fn transact_errors(
     let stopwatch_metrics = StopwatchMetrics::new(
         Logger::root(slog::Discard, o!()),
         deployment.hash.clone(),
+        "transact",
         metrics_registry.clone(),
     );
     store
         .subgraph_store()
-        .writable(LOGGER.clone(), deployment.id.clone())
+        .writable(LOGGER.clone(), deployment.id)
         .await?
         .transact_block_operations(
             block_ptr_to,
-            None,
+            FirehoseCursor::None,
             Vec::new(),
-            stopwatch_metrics,
+            &stopwatch_metrics,
             Vec::new(),
             errs,
+            Vec::new(),
+            Vec::new(),
         )
+        .await?;
+    flush(deployment).await
 }
 
 /// Convenience to transact EntityOperation instead of EntityModification
-pub fn transact_entity_operations(
+pub async fn transact_entity_operations(
     store: &Arc<DieselSubgraphStore>,
     deployment: &DeploymentLocator,
     block_ptr_to: BlockPtr,
     ops: Vec<EntityOperation>,
 ) -> Result<(), StoreError> {
-    transact_entities_and_dynamic_data_sources(store, deployment.clone(), block_ptr_to, vec![], ops)
+    transact_entities_and_dynamic_data_sources(
+        store,
+        deployment.clone(),
+        block_ptr_to,
+        vec![],
+        ops,
+        vec![],
+    )
+    .await
 }
 
-pub fn transact_entities_and_dynamic_data_sources(
+/// Convenience to transact EntityOperation instead of EntityModification and wait for the store to process the operations
+pub async fn transact_and_wait(
+    store: &Arc<DieselSubgraphStore>,
+    deployment: &DeploymentLocator,
+    block_ptr_to: BlockPtr,
+    ops: Vec<EntityOperation>,
+) -> Result<(), StoreError> {
+    transact_entities_and_dynamic_data_sources(
+        store,
+        deployment.clone(),
+        block_ptr_to,
+        vec![],
+        ops,
+        vec![],
+    )
+    .await?;
+    flush(deployment).await
+}
+
+pub async fn transact_entities_and_dynamic_data_sources(
     store: &Arc<DieselSubgraphStore>,
     deployment: DeploymentLocator,
     block_ptr_to: BlockPtr,
     data_sources: Vec<StoredDynamicDataSource>,
     ops: Vec<EntityOperation>,
+    manifest_idx_and_name: Vec<(u32, String)>,
 ) -> Result<(), StoreError> {
     let store =
         futures03::executor::block_on(store.cheap_clone().writable(LOGGER.clone(), deployment.id))?;
-    let mut entity_cache = EntityCache::new(store.clone());
+    let mut entity_cache = EntityCache::new(Arc::new(store.clone()));
     entity_cache.append(ops);
     let mods = entity_cache
         .as_modifications()
@@ -260,26 +299,34 @@ pub fn transact_entities_and_dynamic_data_sources(
     let stopwatch_metrics = StopwatchMetrics::new(
         Logger::root(slog::Discard, o!()),
         deployment.hash.clone(),
+        "transact",
         metrics_registry.clone(),
     );
-    store.transact_block_operations(
-        block_ptr_to,
-        None,
-        mods,
-        stopwatch_metrics,
-        data_sources,
-        Vec::new(),
-    )
+    store
+        .transact_block_operations(
+            block_ptr_to,
+            FirehoseCursor::None,
+            mods,
+            &stopwatch_metrics,
+            data_sources,
+            Vec::new(),
+            manifest_idx_and_name,
+            Vec::new(),
+        )
+        .await
 }
 
+/// Revert to block `ptr` and wait for the store to process the changes
 pub async fn revert_block(store: &Arc<Store>, deployment: &DeploymentLocator, ptr: &BlockPtr) {
     store
         .subgraph_store()
         .writable(LOGGER.clone(), deployment.id)
         .await
         .expect("can get writable")
-        .revert_block_operations(ptr.clone(), None)
+        .revert_block_operations(ptr.clone(), FirehoseCursor::None)
+        .await
         .unwrap();
+    flush(deployment).await.unwrap();
 }
 
 pub fn insert_ens_name(hash: &str, name: &str) {
@@ -296,7 +343,9 @@ pub fn insert_ens_name(hash: &str, name: &str) {
         .unwrap();
 }
 
-pub fn insert_entities(
+/// Insert the given entities and wait until all writes have been processed.
+/// The inserts all happen at `GENESIS_PTR`, i.e., block 0
+pub async fn insert_entities(
     deployment: &DeploymentLocator,
     entities: Vec<(EntityType, Entity)>,
 ) -> Result<(), StoreError> {
@@ -304,9 +353,8 @@ pub fn insert_entities(
         .into_iter()
         .map(|(entity_type, data)| EntityOperation::Set {
             key: EntityKey {
-                subgraph_id: deployment.hash.clone(),
-                entity_type: entity_type.to_owned(),
-                entity_id: data.get("id").unwrap().clone().as_string().unwrap(),
+                entity_type,
+                entity_id: data.get("id").unwrap().clone().as_string().unwrap().into(),
             },
             data,
         });
@@ -317,7 +365,19 @@ pub fn insert_entities(
         GENESIS_PTR.clone(),
         insert_ops.collect::<Vec<_>>(),
     )
-    .map(|_| ())
+    .await?;
+
+    flush(deployment).await
+}
+
+/// Wait until all pending writes have been processed
+pub async fn flush(deployment: &DeploymentLocator) -> Result<(), StoreError> {
+    let writable = SUBGRAPH_STORE
+        .cheap_clone()
+        .writable(LOGGER.clone(), deployment.id)
+        .await
+        .expect("we can get a writable");
+    writable.flush().await
 }
 
 /// Tap into store events sent when running `f` and return those events. This
@@ -341,15 +401,7 @@ where
 
 /// Run a GraphQL query against the `STORE`
 pub async fn execute_subgraph_query(query: Query, target: QueryTarget) -> QueryResults {
-    execute_subgraph_query_with_complexity(query, target, None).await
-}
-
-pub async fn execute_subgraph_query_with_complexity(
-    query: Query,
-    target: QueryTarget,
-    max_complexity: Option<u64>,
-) -> QueryResults {
-    execute_subgraph_query_internal(query, target, max_complexity, None).await
+    execute_subgraph_query_internal(query, target, None, None).await
 }
 
 pub async fn execute_subgraph_query_with_deadline(
@@ -372,8 +424,8 @@ macro_rules! return_err {
     };
 }
 
-pub fn result_size_metrics() -> Arc<ResultSizeMetrics> {
-    Arc::new(ResultSizeMetrics::make(METRICS_REGISTRY.clone()))
+pub fn graphql_metrics() -> Arc<GraphQLMetrics> {
+    Arc::new(GraphQLMetrics::make(METRICS_REGISTRY.clone()))
 }
 
 async fn execute_subgraph_query_internal(
@@ -383,43 +435,47 @@ async fn execute_subgraph_query_internal(
     deadline: Option<Instant>,
 ) -> QueryResults {
     let logger = Logger::root(slog::Discard, o!());
-    let id = match target {
-        QueryTarget::Deployment(id) => id,
+    let (id, version) = match target {
+        QueryTarget::Deployment(id, version) => (id, version),
         _ => unreachable!("tests do not use this"),
     };
-    let schema = SUBGRAPH_STORE.api_schema(&id).unwrap();
+    let schema = SUBGRAPH_STORE.api_schema(&id, &Default::default()).unwrap();
     let status = StatusStore::status(
         STORE.as_ref(),
         status::Filter::Deployments(vec![id.to_string()]),
     )
     .unwrap();
     let network = Some(status[0].chains[0].network.clone());
+    let trace = query.trace;
     let query = return_err!(PreparedQuery::new(
         &logger,
         schema,
         network,
         query,
         max_complexity,
-        100
+        100,
+        graphql_metrics(),
     ));
     let mut result = QueryResults::empty();
     let deployment = query.schema.id().clone();
     let store = STORE
         .clone()
-        .query_store(deployment.into(), false)
+        .query_store(QueryTarget::Deployment(deployment, version.clone()), false)
         .await
         .unwrap();
+    let state = store.deployment_state().await.unwrap();
     for (bc, (selection_set, error_policy)) in return_err!(query.block_constraint()) {
         let logger = logger.clone();
         let resolver = return_err!(
             StoreResolver::at_block(
                 &logger,
                 store.clone(),
+                &state,
                 SUBSCRIPTION_MANAGER.clone(),
                 bc,
                 error_policy,
                 query.schema.id().clone(),
-                result_size_metrics()
+                graphql_metrics()
             )
             .await
         );
@@ -434,6 +490,7 @@ async fn execute_subgraph_query_internal(
                     load_manager: LOAD_MANAGER.clone(),
                     max_first: std::u32::MAX,
                     max_skip: std::u32::MAX,
+                    trace,
                 },
             )
             .await,
@@ -444,7 +501,10 @@ async fn execute_subgraph_query_internal(
 
 pub async fn deployment_state(store: &Store, subgraph_id: &DeploymentHash) -> DeploymentState {
     store
-        .query_store(QueryTarget::Deployment(subgraph_id.to_owned()), false)
+        .query_store(
+            QueryTarget::Deployment(subgraph_id.to_owned(), Default::default()),
+            false,
+        )
         .await
         .expect("could get a query store")
         .deployment_state()
@@ -484,11 +544,11 @@ fn build_store() -> (Arc<Store>, ConnectionPool, Config, Arc<SubscriptionManager
     opt.store_connection_pool_size = CONN_POOL_SIZE;
 
     let config = Config::load(&*LOGGER, &opt)
-        .expect(&format!("config is not valid (file={:?})", &opt.config));
+        .unwrap_or_else(|_| panic!("config is not valid (file={:?})", &opt.config));
     let registry = Arc::new(MockMetricsRegistry::new());
     std::thread::spawn(move || {
         STORE_RUNTIME.handle().block_on(async {
-            let builder = StoreBuilder::new(&*LOGGER, &*NODE_ID, &config, registry).await;
+            let builder = StoreBuilder::new(&*LOGGER, &*NODE_ID, &config, None, registry).await;
             let subscription_manager = builder.subscription_manager();
             let primary_pool = builder.primary_pool();
 

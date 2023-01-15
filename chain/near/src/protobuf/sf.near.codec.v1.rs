@@ -1,3 +1,4 @@
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Block {
     #[prost(string, tag = "1")]
@@ -11,17 +12,19 @@ pub struct Block {
     #[prost(message, repeated, tag = "5")]
     pub state_changes: ::prost::alloc::vec::Vec<StateChangeWithCause>,
 }
-/// HeaderOnlyBlock is a standard [Block] structure where all other fields are
-/// removed so that hydrating that object from a [Block] bytes payload will
+/// HeaderOnlyBlock is a standard \[Block\] structure where all other fields are
+/// removed so that hydrating that object from a \[Block\] bytes payload will
 /// drastically reduced allocated memory required to hold the full block.
 ///
-/// This can be used to unpack a [Block] when only the [BlockHeader] information
+/// This can be used to unpack a \[Block\] when only the \[BlockHeader\] information
 /// is required and greatly reduced required memory.
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct HeaderOnlyBlock {
     #[prost(message, optional, tag = "2")]
     pub header: ::core::option::Option<BlockHeader>,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StateChangeWithCause {
     #[prost(message, optional, tag = "1")]
@@ -29,51 +32,60 @@ pub struct StateChangeWithCause {
     #[prost(message, optional, tag = "2")]
     pub cause: ::core::option::Option<StateChangeCause>,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StateChangeCause {
-    #[prost(
-        oneof = "state_change_cause::Cause",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10"
-    )]
+    #[prost(oneof = "state_change_cause::Cause", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10")]
     pub cause: ::core::option::Option<state_change_cause::Cause>,
 }
 /// Nested message and enum types in `StateChangeCause`.
 pub mod state_change_cause {
+    #[allow(clippy::derive_partial_eq_without_eq)]
     #[derive(Clone, PartialEq, ::prost::Message)]
     pub struct NotWritableToDisk {}
+    #[allow(clippy::derive_partial_eq_without_eq)]
     #[derive(Clone, PartialEq, ::prost::Message)]
     pub struct InitialState {}
+    #[allow(clippy::derive_partial_eq_without_eq)]
     #[derive(Clone, PartialEq, ::prost::Message)]
     pub struct TransactionProcessing {
         #[prost(message, optional, tag = "1")]
         pub tx_hash: ::core::option::Option<super::CryptoHash>,
     }
+    #[allow(clippy::derive_partial_eq_without_eq)]
     #[derive(Clone, PartialEq, ::prost::Message)]
     pub struct ActionReceiptProcessingStarted {
         #[prost(message, optional, tag = "1")]
         pub receipt_hash: ::core::option::Option<super::CryptoHash>,
     }
+    #[allow(clippy::derive_partial_eq_without_eq)]
     #[derive(Clone, PartialEq, ::prost::Message)]
     pub struct ActionReceiptGasReward {
         #[prost(message, optional, tag = "1")]
         pub tx_hash: ::core::option::Option<super::CryptoHash>,
     }
+    #[allow(clippy::derive_partial_eq_without_eq)]
     #[derive(Clone, PartialEq, ::prost::Message)]
     pub struct ReceiptProcessing {
         #[prost(message, optional, tag = "1")]
         pub tx_hash: ::core::option::Option<super::CryptoHash>,
     }
+    #[allow(clippy::derive_partial_eq_without_eq)]
     #[derive(Clone, PartialEq, ::prost::Message)]
     pub struct PostponedReceipt {
         #[prost(message, optional, tag = "1")]
         pub tx_hash: ::core::option::Option<super::CryptoHash>,
     }
+    #[allow(clippy::derive_partial_eq_without_eq)]
     #[derive(Clone, PartialEq, ::prost::Message)]
     pub struct UpdatedDelayedReceipts {}
+    #[allow(clippy::derive_partial_eq_without_eq)]
     #[derive(Clone, PartialEq, ::prost::Message)]
     pub struct ValidatorAccountsUpdate {}
+    #[allow(clippy::derive_partial_eq_without_eq)]
     #[derive(Clone, PartialEq, ::prost::Message)]
     pub struct Migration {}
+    #[allow(clippy::derive_partial_eq_without_eq)]
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Cause {
         #[prost(message, tag = "1")]
@@ -98,6 +110,7 @@ pub mod state_change_cause {
         Migration(Migration),
     }
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StateChangeValue {
     #[prost(oneof = "state_change_value::Value", tags = "1, 2, 3, 4, 5, 6, 7, 8")]
@@ -105,6 +118,7 @@ pub struct StateChangeValue {
 }
 /// Nested message and enum types in `StateChangeValue`.
 pub mod state_change_value {
+    #[allow(clippy::derive_partial_eq_without_eq)]
     #[derive(Clone, PartialEq, ::prost::Message)]
     pub struct AccountUpdate {
         #[prost(string, tag = "1")]
@@ -112,11 +126,13 @@ pub mod state_change_value {
         #[prost(message, optional, tag = "2")]
         pub account: ::core::option::Option<super::Account>,
     }
+    #[allow(clippy::derive_partial_eq_without_eq)]
     #[derive(Clone, PartialEq, ::prost::Message)]
     pub struct AccountDeletion {
         #[prost(string, tag = "1")]
         pub account_id: ::prost::alloc::string::String,
     }
+    #[allow(clippy::derive_partial_eq_without_eq)]
     #[derive(Clone, PartialEq, ::prost::Message)]
     pub struct AccessKeyUpdate {
         #[prost(string, tag = "1")]
@@ -126,6 +142,7 @@ pub mod state_change_value {
         #[prost(message, optional, tag = "3")]
         pub access_key: ::core::option::Option<super::AccessKey>,
     }
+    #[allow(clippy::derive_partial_eq_without_eq)]
     #[derive(Clone, PartialEq, ::prost::Message)]
     pub struct AccessKeyDeletion {
         #[prost(string, tag = "1")]
@@ -133,6 +150,7 @@ pub mod state_change_value {
         #[prost(message, optional, tag = "2")]
         pub public_key: ::core::option::Option<super::PublicKey>,
     }
+    #[allow(clippy::derive_partial_eq_without_eq)]
     #[derive(Clone, PartialEq, ::prost::Message)]
     pub struct DataUpdate {
         #[prost(string, tag = "1")]
@@ -142,6 +160,7 @@ pub mod state_change_value {
         #[prost(bytes = "vec", tag = "3")]
         pub value: ::prost::alloc::vec::Vec<u8>,
     }
+    #[allow(clippy::derive_partial_eq_without_eq)]
     #[derive(Clone, PartialEq, ::prost::Message)]
     pub struct DataDeletion {
         #[prost(string, tag = "1")]
@@ -149,6 +168,7 @@ pub mod state_change_value {
         #[prost(bytes = "vec", tag = "2")]
         pub key: ::prost::alloc::vec::Vec<u8>,
     }
+    #[allow(clippy::derive_partial_eq_without_eq)]
     #[derive(Clone, PartialEq, ::prost::Message)]
     pub struct ContractCodeUpdate {
         #[prost(string, tag = "1")]
@@ -156,11 +176,13 @@ pub mod state_change_value {
         #[prost(bytes = "vec", tag = "2")]
         pub code: ::prost::alloc::vec::Vec<u8>,
     }
+    #[allow(clippy::derive_partial_eq_without_eq)]
     #[derive(Clone, PartialEq, ::prost::Message)]
     pub struct ContractCodeDeletion {
         #[prost(string, tag = "1")]
         pub account_id: ::prost::alloc::string::String,
     }
+    #[allow(clippy::derive_partial_eq_without_eq)]
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Value {
         #[prost(message, tag = "1")]
@@ -181,6 +203,7 @@ pub mod state_change_value {
         ContractDeletion(ContractCodeDeletion),
     }
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Account {
     #[prost(message, optional, tag = "1")]
@@ -192,6 +215,7 @@ pub struct Account {
     #[prost(uint64, tag = "4")]
     pub storage_usage: u64,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct BlockHeader {
     #[prost(uint64, tag = "1")]
@@ -259,16 +283,19 @@ pub struct BlockHeader {
     #[prost(uint32, tag = "32")]
     pub latest_protocol_version: u32,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct BigInt {
     #[prost(bytes = "vec", tag = "1")]
     pub bytes: ::prost::alloc::vec::Vec<u8>,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CryptoHash {
     #[prost(bytes = "vec", tag = "1")]
     pub bytes: ::prost::alloc::vec::Vec<u8>,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Signature {
     #[prost(enumeration = "CurveKind", tag = "1")]
@@ -276,6 +303,7 @@ pub struct Signature {
     #[prost(bytes = "vec", tag = "2")]
     pub bytes: ::prost::alloc::vec::Vec<u8>,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PublicKey {
     #[prost(enumeration = "CurveKind", tag = "1")]
@@ -283,6 +311,7 @@ pub struct PublicKey {
     #[prost(bytes = "vec", tag = "2")]
     pub bytes: ::prost::alloc::vec::Vec<u8>,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ValidatorStake {
     #[prost(string, tag = "1")]
@@ -292,6 +321,7 @@ pub struct ValidatorStake {
     #[prost(message, optional, tag = "3")]
     pub stake: ::core::option::Option<BigInt>,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SlashedValidator {
     #[prost(string, tag = "1")]
@@ -299,6 +329,7 @@ pub struct SlashedValidator {
     #[prost(bool, tag = "2")]
     pub is_double_sign: bool,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ChunkHeader {
     #[prost(bytes = "vec", tag = "1")]
@@ -336,6 +367,7 @@ pub struct ChunkHeader {
     #[prost(message, optional, tag = "17")]
     pub signature: ::core::option::Option<Signature>,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct IndexerShard {
     #[prost(uint64, tag = "1")]
@@ -343,8 +375,11 @@ pub struct IndexerShard {
     #[prost(message, optional, tag = "2")]
     pub chunk: ::core::option::Option<IndexerChunk>,
     #[prost(message, repeated, tag = "3")]
-    pub receipt_execution_outcomes: ::prost::alloc::vec::Vec<IndexerExecutionOutcomeWithReceipt>,
+    pub receipt_execution_outcomes: ::prost::alloc::vec::Vec<
+        IndexerExecutionOutcomeWithReceipt,
+    >,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct IndexerExecutionOutcomeWithReceipt {
     #[prost(message, optional, tag = "1")]
@@ -352,6 +387,7 @@ pub struct IndexerExecutionOutcomeWithReceipt {
     #[prost(message, optional, tag = "2")]
     pub receipt: ::core::option::Option<Receipt>,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct IndexerChunk {
     #[prost(string, tag = "1")]
@@ -363,6 +399,7 @@ pub struct IndexerChunk {
     #[prost(message, repeated, tag = "4")]
     pub receipts: ::prost::alloc::vec::Vec<Receipt>,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct IndexerTransactionWithOutcome {
     #[prost(message, optional, tag = "1")]
@@ -370,6 +407,7 @@ pub struct IndexerTransactionWithOutcome {
     #[prost(message, optional, tag = "2")]
     pub outcome: ::core::option::Option<IndexerExecutionOutcomeWithOptionalReceipt>,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SignedTransaction {
     #[prost(string, tag = "1")]
@@ -387,6 +425,7 @@ pub struct SignedTransaction {
     #[prost(message, optional, tag = "7")]
     pub hash: ::core::option::Option<CryptoHash>,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct IndexerExecutionOutcomeWithOptionalReceipt {
     #[prost(message, optional, tag = "1")]
@@ -394,6 +433,7 @@ pub struct IndexerExecutionOutcomeWithOptionalReceipt {
     #[prost(message, optional, tag = "2")]
     pub receipt: ::core::option::Option<Receipt>,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Receipt {
     #[prost(string, tag = "1")]
@@ -407,6 +447,7 @@ pub struct Receipt {
 }
 /// Nested message and enum types in `Receipt`.
 pub mod receipt {
+    #[allow(clippy::derive_partial_eq_without_eq)]
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Receipt {
         #[prost(message, tag = "10")]
@@ -415,6 +456,7 @@ pub mod receipt {
         Data(super::ReceiptData),
     }
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ReceiptData {
     #[prost(message, optional, tag = "1")]
@@ -422,6 +464,7 @@ pub struct ReceiptData {
     #[prost(bytes = "vec", tag = "2")]
     pub data: ::prost::alloc::vec::Vec<u8>,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ReceiptAction {
     #[prost(string, tag = "1")]
@@ -437,6 +480,7 @@ pub struct ReceiptAction {
     #[prost(message, repeated, tag = "6")]
     pub actions: ::prost::alloc::vec::Vec<Action>,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DataReceiver {
     #[prost(message, optional, tag = "1")]
@@ -444,6 +488,7 @@ pub struct DataReceiver {
     #[prost(string, tag = "2")]
     pub receiver_id: ::prost::alloc::string::String,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ExecutionOutcomeWithId {
     #[prost(message, optional, tag = "1")]
@@ -455,6 +500,7 @@ pub struct ExecutionOutcomeWithId {
     #[prost(message, optional, tag = "4")]
     pub outcome: ::core::option::Option<ExecutionOutcome>,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ExecutionOutcome {
     #[prost(string, repeated, tag = "1")]
@@ -474,6 +520,7 @@ pub struct ExecutionOutcome {
 }
 /// Nested message and enum types in `ExecutionOutcome`.
 pub mod execution_outcome {
+    #[allow(clippy::derive_partial_eq_without_eq)]
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Status {
         #[prost(message, tag = "20")]
@@ -486,18 +533,22 @@ pub mod execution_outcome {
         SuccessReceiptId(super::SuccessReceiptIdExecutionStatus),
     }
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SuccessValueExecutionStatus {
     #[prost(bytes = "vec", tag = "1")]
     pub value: ::prost::alloc::vec::Vec<u8>,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SuccessReceiptIdExecutionStatus {
     #[prost(message, optional, tag = "1")]
     pub id: ::core::option::Option<CryptoHash>,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct UnknownExecutionStatus {}
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct FailureExecutionStatus {
     #[prost(oneof = "failure_execution_status::Failure", tags = "1, 2")]
@@ -505,6 +556,7 @@ pub struct FailureExecutionStatus {
 }
 /// Nested message and enum types in `FailureExecutionStatus`.
 pub mod failure_execution_status {
+    #[allow(clippy::derive_partial_eq_without_eq)]
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Failure {
         #[prost(message, tag = "1")]
@@ -513,6 +565,7 @@ pub mod failure_execution_status {
         InvalidTxError(i32),
     }
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ActionError {
     #[prost(uint64, tag = "1")]
@@ -525,6 +578,7 @@ pub struct ActionError {
 }
 /// Nested message and enum types in `ActionError`.
 pub mod action_error {
+    #[allow(clippy::derive_partial_eq_without_eq)]
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Kind {
         #[prost(message, tag = "21")]
@@ -556,22 +610,27 @@ pub mod action_error {
         #[prost(message, tag = "34")]
         NewReceiptValidation(super::NewReceiptValidationErrorKind),
         #[prost(message, tag = "35")]
-        OnlyImplicitAccountCreationAllowed(super::OnlyImplicitAccountCreationAllowedErrorKind),
+        OnlyImplicitAccountCreationAllowed(
+            super::OnlyImplicitAccountCreationAllowedErrorKind,
+        ),
         #[prost(message, tag = "36")]
         DeleteAccountWithLargeState(super::DeleteAccountWithLargeStateErrorKind),
     }
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AccountAlreadyExistsErrorKind {
     #[prost(string, tag = "1")]
     pub account_id: ::prost::alloc::string::String,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AccountDoesNotExistErrorKind {
     #[prost(string, tag = "1")]
     pub account_id: ::prost::alloc::string::String,
 }
-//// A top-level account ID can only be created by registrar.
+/// / A top-level account ID can only be created by registrar.
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CreateAccountOnlyByRegistrarErrorKind {
     #[prost(string, tag = "1")]
@@ -581,6 +640,7 @@ pub struct CreateAccountOnlyByRegistrarErrorKind {
     #[prost(string, tag = "3")]
     pub predecessor_id: ::prost::alloc::string::String,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CreateAccountNotAllowedErrorKind {
     #[prost(string, tag = "1")]
@@ -588,6 +648,7 @@ pub struct CreateAccountNotAllowedErrorKind {
     #[prost(string, tag = "2")]
     pub predecessor_id: ::prost::alloc::string::String,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ActorNoPermissionErrorKind {
     #[prost(string, tag = "1")]
@@ -595,6 +656,7 @@ pub struct ActorNoPermissionErrorKind {
     #[prost(string, tag = "2")]
     pub actor_id: ::prost::alloc::string::String,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DeleteKeyDoesNotExistErrorKind {
     #[prost(string, tag = "1")]
@@ -602,6 +664,7 @@ pub struct DeleteKeyDoesNotExistErrorKind {
     #[prost(message, optional, tag = "2")]
     pub public_key: ::core::option::Option<PublicKey>,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AddKeyAlreadyExistsErrorKind {
     #[prost(string, tag = "1")]
@@ -609,11 +672,13 @@ pub struct AddKeyAlreadyExistsErrorKind {
     #[prost(message, optional, tag = "2")]
     pub public_key: ::core::option::Option<PublicKey>,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DeleteAccountStakingErrorKind {
     #[prost(string, tag = "1")]
     pub account_id: ::prost::alloc::string::String,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct LackBalanceForStateErrorKind {
     #[prost(string, tag = "1")]
@@ -621,11 +686,13 @@ pub struct LackBalanceForStateErrorKind {
     #[prost(message, optional, tag = "2")]
     pub balance: ::core::option::Option<BigInt>,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TriesToUnstakeErrorKind {
     #[prost(string, tag = "1")]
     pub account_id: ::prost::alloc::string::String,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TriesToStakeErrorKind {
     #[prost(string, tag = "1")]
@@ -637,6 +704,7 @@ pub struct TriesToStakeErrorKind {
     #[prost(message, optional, tag = "4")]
     pub balance: ::core::option::Option<BigInt>,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct InsufficientStakeErrorKind {
     #[prost(string, tag = "1")]
@@ -646,31 +714,37 @@ pub struct InsufficientStakeErrorKind {
     #[prost(message, optional, tag = "3")]
     pub minimum_stake: ::core::option::Option<BigInt>,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct FunctionCallErrorKind {
     #[prost(enumeration = "FunctionCallErrorSer", tag = "1")]
     pub error: i32,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct NewReceiptValidationErrorKind {
     #[prost(enumeration = "ReceiptValidationError", tag = "1")]
     pub error: i32,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct OnlyImplicitAccountCreationAllowedErrorKind {
     #[prost(string, tag = "1")]
     pub account_id: ::prost::alloc::string::String,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DeleteAccountWithLargeStateErrorKind {
     #[prost(string, tag = "1")]
     pub account_id: ::prost::alloc::string::String,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MerklePath {
     #[prost(message, repeated, tag = "1")]
     pub path: ::prost::alloc::vec::Vec<MerklePathItem>,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MerklePathItem {
     #[prost(message, optional, tag = "1")]
@@ -678,6 +752,7 @@ pub struct MerklePathItem {
     #[prost(enumeration = "Direction", tag = "2")]
     pub direction: i32,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Action {
     #[prost(oneof = "action::Action", tags = "1, 2, 3, 4, 5, 6, 7, 8")]
@@ -685,6 +760,7 @@ pub struct Action {
 }
 /// Nested message and enum types in `Action`.
 pub mod action {
+    #[allow(clippy::derive_partial_eq_without_eq)]
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Action {
         #[prost(message, tag = "1")]
@@ -705,13 +781,16 @@ pub mod action {
         DeleteAccount(super::DeleteAccountAction),
     }
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CreateAccountAction {}
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DeployContractAction {
     #[prost(bytes = "vec", tag = "1")]
     pub code: ::prost::alloc::vec::Vec<u8>,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct FunctionCallAction {
     #[prost(string, tag = "1")]
@@ -723,11 +802,13 @@ pub struct FunctionCallAction {
     #[prost(message, optional, tag = "4")]
     pub deposit: ::core::option::Option<BigInt>,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TransferAction {
     #[prost(message, optional, tag = "1")]
     pub deposit: ::core::option::Option<BigInt>,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StakeAction {
     #[prost(message, optional, tag = "1")]
@@ -735,6 +816,7 @@ pub struct StakeAction {
     #[prost(message, optional, tag = "2")]
     pub public_key: ::core::option::Option<PublicKey>,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AddKeyAction {
     #[prost(message, optional, tag = "1")]
@@ -742,16 +824,19 @@ pub struct AddKeyAction {
     #[prost(message, optional, tag = "2")]
     pub access_key: ::core::option::Option<AccessKey>,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DeleteKeyAction {
     #[prost(message, optional, tag = "1")]
     pub public_key: ::core::option::Option<PublicKey>,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DeleteAccountAction {
     #[prost(string, tag = "1")]
     pub beneficiary_id: ::prost::alloc::string::String,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AccessKey {
     #[prost(uint64, tag = "1")]
@@ -759,6 +844,7 @@ pub struct AccessKey {
     #[prost(message, optional, tag = "2")]
     pub permission: ::core::option::Option<AccessKeyPermission>,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AccessKeyPermission {
     #[prost(oneof = "access_key_permission::Permission", tags = "1, 2")]
@@ -766,6 +852,7 @@ pub struct AccessKeyPermission {
 }
 /// Nested message and enum types in `AccessKeyPermission`.
 pub mod access_key_permission {
+    #[allow(clippy::derive_partial_eq_without_eq)]
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Permission {
         #[prost(message, tag = "1")]
@@ -774,6 +861,7 @@ pub mod access_key_permission {
         FullAccess(super::FullAccessPermission),
     }
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct FunctionCallPermission {
     #[prost(message, optional, tag = "1")]
@@ -783,6 +871,7 @@ pub struct FunctionCallPermission {
     #[prost(string, repeated, tag = "3")]
     pub method_names: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct FullAccessPermission {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
@@ -791,12 +880,50 @@ pub enum CurveKind {
     Ed25519 = 0,
     Secp256k1 = 1,
 }
+impl CurveKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            CurveKind::Ed25519 => "ED25519",
+            CurveKind::Secp256k1 => "SECP256K1",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "ED25519" => Some(Self::Ed25519),
+            "SECP256K1" => Some(Self::Secp256k1),
+            _ => None,
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum ExecutionMetadata {
     V1 = 0,
 }
-///todo: add more detail?
+impl ExecutionMetadata {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            ExecutionMetadata::V1 => "ExecutionMetadataV1",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "ExecutionMetadataV1" => Some(Self::V1),
+            _ => None,
+        }
+    }
+}
+/// todo: add more detail?
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum FunctionCallErrorSer {
@@ -809,7 +936,39 @@ pub enum FunctionCallErrorSer {
     EvmError = 6,
     ExecutionError = 7,
 }
-///todo: add more detail?
+impl FunctionCallErrorSer {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            FunctionCallErrorSer::CompilationError => "CompilationError",
+            FunctionCallErrorSer::LinkError => "LinkError",
+            FunctionCallErrorSer::MethodResolveError => "MethodResolveError",
+            FunctionCallErrorSer::WasmTrap => "WasmTrap",
+            FunctionCallErrorSer::WasmUnknownError => "WasmUnknownError",
+            FunctionCallErrorSer::HostError => "HostError",
+            FunctionCallErrorSer::EvmError => "_EVMError",
+            FunctionCallErrorSer::ExecutionError => "ExecutionError",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "CompilationError" => Some(Self::CompilationError),
+            "LinkError" => Some(Self::LinkError),
+            "MethodResolveError" => Some(Self::MethodResolveError),
+            "WasmTrap" => Some(Self::WasmTrap),
+            "WasmUnknownError" => Some(Self::WasmUnknownError),
+            "HostError" => Some(Self::HostError),
+            "_EVMError" => Some(Self::EvmError),
+            "ExecutionError" => Some(Self::ExecutionError),
+            _ => None,
+        }
+    }
+}
+/// todo: add more detail?
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum ReceiptValidationError {
@@ -821,7 +980,45 @@ pub enum ReceiptValidationError {
     NumberInputDataDependenciesExceeded = 5,
     ActionsValidationError = 6,
 }
-///todo: add more detail?
+impl ReceiptValidationError {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            ReceiptValidationError::InvalidPredecessorId => "InvalidPredecessorId",
+            ReceiptValidationError::InvalidReceiverAccountId => {
+                "InvalidReceiverAccountId"
+            }
+            ReceiptValidationError::InvalidSignerAccountId => "InvalidSignerAccountId",
+            ReceiptValidationError::InvalidDataReceiverId => "InvalidDataReceiverId",
+            ReceiptValidationError::ReturnedValueLengthExceeded => {
+                "ReturnedValueLengthExceeded"
+            }
+            ReceiptValidationError::NumberInputDataDependenciesExceeded => {
+                "NumberInputDataDependenciesExceeded"
+            }
+            ReceiptValidationError::ActionsValidationError => "ActionsValidationError",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "InvalidPredecessorId" => Some(Self::InvalidPredecessorId),
+            "InvalidReceiverAccountId" => Some(Self::InvalidReceiverAccountId),
+            "InvalidSignerAccountId" => Some(Self::InvalidSignerAccountId),
+            "InvalidDataReceiverId" => Some(Self::InvalidDataReceiverId),
+            "ReturnedValueLengthExceeded" => Some(Self::ReturnedValueLengthExceeded),
+            "NumberInputDataDependenciesExceeded" => {
+                Some(Self::NumberInputDataDependenciesExceeded)
+            }
+            "ActionsValidationError" => Some(Self::ActionsValidationError),
+            _ => None,
+        }
+    }
+}
+/// todo: add more detail?
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum InvalidTxError {
@@ -840,9 +1037,73 @@ pub enum InvalidTxError {
     ActionsValidation = 12,
     TransactionSizeExceeded = 13,
 }
+impl InvalidTxError {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            InvalidTxError::InvalidAccessKeyError => "InvalidAccessKeyError",
+            InvalidTxError::InvalidSignerId => "InvalidSignerId",
+            InvalidTxError::SignerDoesNotExist => "SignerDoesNotExist",
+            InvalidTxError::InvalidNonce => "InvalidNonce",
+            InvalidTxError::NonceTooLarge => "NonceTooLarge",
+            InvalidTxError::InvalidReceiverId => "InvalidReceiverId",
+            InvalidTxError::InvalidSignature => "InvalidSignature",
+            InvalidTxError::NotEnoughBalance => "NotEnoughBalance",
+            InvalidTxError::LackBalanceForState => "LackBalanceForState",
+            InvalidTxError::CostOverflow => "CostOverflow",
+            InvalidTxError::InvalidChain => "InvalidChain",
+            InvalidTxError::Expired => "Expired",
+            InvalidTxError::ActionsValidation => "ActionsValidation",
+            InvalidTxError::TransactionSizeExceeded => "TransactionSizeExceeded",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "InvalidAccessKeyError" => Some(Self::InvalidAccessKeyError),
+            "InvalidSignerId" => Some(Self::InvalidSignerId),
+            "SignerDoesNotExist" => Some(Self::SignerDoesNotExist),
+            "InvalidNonce" => Some(Self::InvalidNonce),
+            "NonceTooLarge" => Some(Self::NonceTooLarge),
+            "InvalidReceiverId" => Some(Self::InvalidReceiverId),
+            "InvalidSignature" => Some(Self::InvalidSignature),
+            "NotEnoughBalance" => Some(Self::NotEnoughBalance),
+            "LackBalanceForState" => Some(Self::LackBalanceForState),
+            "CostOverflow" => Some(Self::CostOverflow),
+            "InvalidChain" => Some(Self::InvalidChain),
+            "Expired" => Some(Self::Expired),
+            "ActionsValidation" => Some(Self::ActionsValidation),
+            "TransactionSizeExceeded" => Some(Self::TransactionSizeExceeded),
+            _ => None,
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum Direction {
     Left = 0,
     Right = 1,
+}
+impl Direction {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Direction::Left => "left",
+            Direction::Right => "right",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "left" => Some(Self::Left),
+            "right" => Some(Self::Right),
+            _ => None,
+        }
+    }
 }

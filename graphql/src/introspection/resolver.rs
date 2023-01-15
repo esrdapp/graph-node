@@ -1,4 +1,5 @@
 use graph::data::graphql::ext::{FieldExt, TypeDefinitionExt};
+use graph::data::query::Trace;
 use graphql_parser::Pos;
 use std::collections::BTreeMap;
 
@@ -358,7 +359,7 @@ impl Resolver for IntrospectionResolver {
     // see `fn as_introspection_context`, so this value is irrelevant.
     const CACHEABLE: bool = false;
 
-    async fn query_permit(&self) -> tokio::sync::OwnedSemaphorePermit {
+    async fn query_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, QueryExecutionError> {
         unreachable!()
     }
 
@@ -366,11 +367,11 @@ impl Resolver for IntrospectionResolver {
         &self,
         _: &ExecutionContext<Self>,
         _: &a::SelectionSet,
-    ) -> Result<Option<r::Value>, Vec<QueryExecutionError>> {
-        Ok(None)
+    ) -> Result<(Option<r::Value>, Trace), Vec<QueryExecutionError>> {
+        Ok((None, Trace::None))
     }
 
-    fn resolve_objects(
+    async fn resolve_objects(
         &self,
         prefetched_objects: Option<r::Value>,
         field: &a::Field,
@@ -394,7 +395,7 @@ impl Resolver for IntrospectionResolver {
                                 _ => None,
                             })
                             .filter_map(|type_name| self.type_objects.get(type_name).cloned())
-                            .map(|v| r::Value::try_from(v))
+                            .map(r::Value::try_from)
                             .collect::<Result<_, _>>()
                             .map_err(|v| {
                                 QueryExecutionError::ValueParseError(
@@ -411,7 +412,7 @@ impl Resolver for IntrospectionResolver {
         }
     }
 
-    fn resolve_object(
+    async fn resolve_object(
         &self,
         prefetched_object: Option<r::Value>,
         field: &a::Field,

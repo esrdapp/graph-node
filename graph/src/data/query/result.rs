@@ -10,6 +10,8 @@ use serde::Serialize;
 use std::convert::TryFrom;
 use std::sync::Arc;
 
+use super::Trace;
+
 fn serialize_data<S>(data: &Option<Data>, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
@@ -57,6 +59,33 @@ impl QueryResults {
     pub fn first(&self) -> Option<&Arc<QueryResult>> {
         self.results.first()
     }
+
+    pub fn has_errors(&self) -> bool {
+        self.results.iter().any(|result| result.has_errors())
+    }
+
+    pub fn not_found(&self) -> bool {
+        self.results.iter().any(|result| result.not_found())
+    }
+
+    pub fn deployment_hash(&self) -> Option<&DeploymentHash> {
+        self.results
+            .iter()
+            .filter_map(|result| result.deployment.as_ref())
+            .next()
+    }
+
+    pub fn traces(&self) -> Vec<&Trace> {
+        self.results.iter().map(|res| &res.trace).collect()
+    }
+
+    pub fn errors(&self) -> Vec<QueryError> {
+        self.results
+            .iter()
+            .map(|r| r.errors.clone())
+            .flatten()
+            .collect()
+    }
 }
 
 impl Serialize for QueryResults {
@@ -70,7 +99,14 @@ impl Serialize for QueryResults {
         if has_errors {
             len += 1;
         }
-
+        let first_trace = self
+            .results
+            .iter()
+            .find(|r| !r.trace.is_none())
+            .map(|r| &r.trace);
+        if first_trace.is_some() {
+            len += 1;
+        }
         let mut state = serializer.serialize_struct("QueryResults", len)?;
 
         // Serialize data.
@@ -96,7 +132,7 @@ impl Serialize for QueryResults {
             impl Serialize for SerError<'_> {
                 fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
                     let mut seq = serializer.serialize_seq(None)?;
-                    for err in self.0.results.iter().map(|r| &r.errors).flatten() {
+                    for err in self.0.results.iter().flat_map(|r| &r.errors) {
                         seq.serialize_element(err)?;
                     }
                     seq.end()
@@ -106,6 +142,9 @@ impl Serialize for QueryResults {
             state.serialize_field("errors", &SerError(self))?;
         }
 
+        if let Some(trace) = first_trace {
+            state.serialize_field("trace", trace)?;
+        }
         state.end()
     }
 }
@@ -173,7 +212,7 @@ impl QueryResults {
 }
 
 /// The result of running a query, if successful.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 pub struct QueryResult {
     #[serde(
         skip_serializing_if = "Option::is_none",
@@ -184,6 +223,8 @@ pub struct QueryResult {
     errors: Vec<QueryError>,
     #[serde(skip_serializing)]
     pub deployment: Option<DeploymentHash>,
+    #[serde(skip_serializing)]
+    pub trace: Trace,
 }
 
 impl QueryResult {
@@ -192,23 +233,33 @@ impl QueryResult {
             data: Some(data),
             errors: Vec::new(),
             deployment: None,
+            trace: Trace::None,
         }
     }
 
     /// This is really `clone`, but we do not want to implement `Clone`;
     /// this is only meant for test purposes and should not be used in production
     /// code since cloning query results can be very expensive
-    #[cfg(debug_assertions)]
     pub fn duplicate(&self) -> Self {
         Self {
             data: self.data.clone(),
             errors: self.errors.clone(),
             deployment: self.deployment.clone(),
+            trace: Trace::None,
         }
     }
 
     pub fn has_errors(&self) -> bool {
         !self.errors.is_empty()
+    }
+
+    pub fn not_found(&self) -> bool {
+        self.errors.iter().any(|e| {
+            matches!(
+                e,
+                QueryError::ExecutionError(QueryExecutionError::DeploymentNotFound(_))
+            )
+        })
     }
 
     pub fn has_data(&self) -> bool {
@@ -238,6 +289,10 @@ impl QueryResult {
     pub fn errors_mut(&mut self) -> &mut Vec<QueryError> {
         &mut self.errors
     }
+
+    pub fn data(&self) -> Option<&Data> {
+        self.data.as_ref()
+    }
 }
 
 impl From<QueryExecutionError> for QueryResult {
@@ -246,6 +301,7 @@ impl From<QueryExecutionError> for QueryResult {
             data: None,
             errors: vec![e.into()],
             deployment: None,
+            trace: Trace::None,
         }
     }
 }
@@ -256,6 +312,7 @@ impl From<QueryError> for QueryResult {
             data: None,
             errors: vec![e],
             deployment: None,
+            trace: Trace::None,
         }
     }
 }
@@ -266,6 +323,7 @@ impl From<Vec<QueryExecutionError>> for QueryResult {
             data: None,
             errors: e.into_iter().map(QueryError::from).collect(),
             deployment: None,
+            trace: Trace::None,
         }
     }
 }
@@ -273,6 +331,14 @@ impl From<Vec<QueryExecutionError>> for QueryResult {
 impl From<Object> for QueryResult {
     fn from(val: Object) -> Self {
         QueryResult::new(val)
+    }
+}
+
+impl From<(Object, Trace)> for QueryResult {
+    fn from((val, trace): (Object, Trace)) -> Self {
+        let mut res = QueryResult::new(val);
+        res.trace = trace;
+        res
     }
 }
 
@@ -309,9 +375,8 @@ fn multiple_data_items() {
     use serde_json::json;
 
     fn make_obj(key: &str, value: &str) -> Arc<QueryResult> {
-        let mut map = Object::new();
-        map.insert(key.to_owned(), r::Value::String(value.to_owned()));
-        Arc::new(map.into())
+        let obj = Object::from_iter([(key.to_owned(), r::Value::String(value.to_owned()))]);
+        Arc::new(obj.into())
     }
 
     let obj1 = make_obj("key1", "value1");

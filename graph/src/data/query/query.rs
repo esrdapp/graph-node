@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::{
     data::graphql::shape_hash::shape_hash,
-    prelude::{q, r, DeploymentHash, SubgraphName},
+    prelude::{q, r, ApiVersion, DeploymentHash, SubgraphName, ENV_VARS},
 };
 
 fn deserialize_number<'de, D>(deserializer: D) -> Result<q::Number, D::Error>
@@ -112,19 +112,15 @@ impl serde::ser::Serialize for QueryVariables {
 
 #[derive(Clone, Debug)]
 pub enum QueryTarget {
-    Name(SubgraphName),
-    Deployment(DeploymentHash),
+    Name(SubgraphName, ApiVersion),
+    Deployment(DeploymentHash, ApiVersion),
 }
 
-impl From<DeploymentHash> for QueryTarget {
-    fn from(id: DeploymentHash) -> Self {
-        Self::Deployment(id)
-    }
-}
-
-impl From<SubgraphName> for QueryTarget {
-    fn from(name: SubgraphName) -> Self {
-        QueryTarget::Name(name)
+impl QueryTarget {
+    pub fn get_version(&self) -> &ApiVersion {
+        match self {
+            Self::Deployment(_, version) | Self::Name(_, version) => version,
+        }
     }
 }
 
@@ -136,14 +132,18 @@ pub struct Query {
     pub shape_hash: u64,
     pub query_text: Arc<String>,
     pub variables_text: Arc<String>,
+    pub trace: bool,
     _force_use_of_new: (),
 }
 
 impl Query {
-    pub fn new(document: q::Document, variables: Option<QueryVariables>) -> Self {
+    pub fn new(document: q::Document, variables: Option<QueryVariables>, trace: bool) -> Self {
         let shape_hash = shape_hash(&document);
 
-        let (query_text, variables_text) = if *crate::log::LOG_GQL_TIMING {
+        let (query_text, variables_text) = if trace
+            || ENV_VARS.log_gql_timing()
+            || (ENV_VARS.graphql.enable_validations && ENV_VARS.graphql.silent_graphql_validations)
+        {
             (
                 document
                     .format(graphql_parser::Style::default().indent(0))
@@ -160,6 +160,7 @@ impl Query {
             shape_hash,
             query_text: Arc::new(query_text),
             variables_text: Arc::new(variables_text),
+            trace,
             _force_use_of_new: (),
         }
     }

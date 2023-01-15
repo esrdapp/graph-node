@@ -1,13 +1,17 @@
 use anyhow::Error;
 use async_stream::stream;
 use futures03::Stream;
+use std::fmt;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
 use super::{Block, BlockPtr, Blockchain};
-use crate::components::store::BlockNumber;
-use crate::firehose;
+use crate::anyhow::Result;
+use crate::components::store::{BlockNumber, DeploymentLocator};
+use crate::data::subgraph::UnifiedMappingApiVersion;
+use crate::firehose::{self, FirehoseEndpoint};
+use crate::substreams::BlockScopedData;
 use crate::{prelude::*, prometheus::labels};
 
 pub struct BufferedBlockStream<C: Blockchain> {
@@ -46,14 +50,7 @@ impl<C: Blockchain + 'static> BufferedBlockStream<C> {
         mut stream: Box<dyn BlockStream<C>>,
         sender: Sender<Result<BlockStreamEvent<C>, Error>>,
     ) -> Result<(), Error> {
-        loop {
-            let event = match stream.next().await {
-                Some(evt) => evt,
-                None => {
-                    break;
-                }
-            };
-
+        while let Some(event) = stream.next().await {
             match sender.send(event).await {
                 Ok(_) => continue,
                 Err(err) => {
@@ -87,17 +84,134 @@ pub trait BlockStream<C: Blockchain>:
 {
 }
 
-pub type FirehoseCursor = Option<String>;
+/// BlockRefetcher abstraction allows a chain to decide if a block must be refetched after a dynamic data source was added
+#[async_trait]
+pub trait BlockRefetcher<C: Blockchain>: Send + Sync {
+    //    type Block: Block + Clone + Debug + Default;
+    fn required(&self, chain: &C) -> bool;
 
+    async fn get_block(
+        &self,
+        chain: &C,
+        logger: &Logger,
+        cursor: FirehoseCursor,
+    ) -> Result<C::Block, Error>;
+}
+
+/// BlockStreamBuilder is an abstraction that would separate the logic for building streams from the blockchain trait
+#[async_trait]
+pub trait BlockStreamBuilder<C: Blockchain>: Send + Sync {
+    async fn build_firehose(
+        &self,
+        chain: &C,
+        deployment: DeploymentLocator,
+        block_cursor: FirehoseCursor,
+        start_blocks: Vec<BlockNumber>,
+        subgraph_current_block: Option<BlockPtr>,
+        filter: Arc<C::TriggerFilter>,
+        unified_api_version: UnifiedMappingApiVersion,
+    ) -> Result<Box<dyn BlockStream<C>>>;
+
+    async fn build_polling(
+        &self,
+        chain: Arc<C>,
+        deployment: DeploymentLocator,
+        start_blocks: Vec<BlockNumber>,
+        subgraph_current_block: Option<BlockPtr>,
+        filter: Arc<C::TriggerFilter>,
+        unified_api_version: UnifiedMappingApiVersion,
+    ) -> Result<Box<dyn BlockStream<C>>>;
+}
+
+#[derive(Debug, Clone)]
+pub struct FirehoseCursor(Option<String>);
+
+impl FirehoseCursor {
+    #[allow(non_upper_case_globals)]
+    pub const None: Self = FirehoseCursor(None);
+
+    pub fn is_none(&self) -> bool {
+        self.0.is_none()
+    }
+}
+
+impl fmt::Display for FirehoseCursor {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        f.write_str(self.0.as_deref().unwrap_or(""))
+    }
+}
+
+impl From<String> for FirehoseCursor {
+    fn from(cursor: String) -> Self {
+        // Treat a cursor of "" as None, not absolutely necessary for correctness since the firehose
+        // treats both as the same, but makes it a little clearer.
+        if cursor.is_empty() {
+            FirehoseCursor::None
+        } else {
+            FirehoseCursor(Some(cursor))
+        }
+    }
+}
+
+impl From<Option<String>> for FirehoseCursor {
+    fn from(cursor: Option<String>) -> Self {
+        match cursor {
+            None => FirehoseCursor::None,
+            Some(s) => FirehoseCursor::from(s),
+        }
+    }
+}
+
+impl AsRef<Option<String>> for FirehoseCursor {
+    fn as_ref(&self) -> &Option<String> {
+        &self.0
+    }
+}
+
+#[derive(Debug)]
 pub struct BlockWithTriggers<C: Blockchain> {
     pub block: C::Block,
     pub trigger_data: Vec<C::TriggerData>,
 }
 
+impl<C: Blockchain> Clone for BlockWithTriggers<C>
+where
+    C::TriggerData: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            block: self.block.clone(),
+            trigger_data: self.trigger_data.clone(),
+        }
+    }
+}
+
 impl<C: Blockchain> BlockWithTriggers<C> {
-    pub fn new(block: C::Block, mut trigger_data: Vec<C::TriggerData>) -> Self {
+    /// Creates a BlockWithTriggers structure, which holds
+    /// the trigger data ordered and without any duplicates.
+    pub fn new(block: C::Block, mut trigger_data: Vec<C::TriggerData>, logger: &Logger) -> Self {
         // This is where triggers get sorted.
         trigger_data.sort();
+
+        let old_len = trigger_data.len();
+
+        // This is removing the duplicate triggers in the case of multiple
+        // data sources fetching the same event/call/etc.
+        trigger_data.dedup();
+
+        let new_len = trigger_data.len();
+
+        if new_len != old_len {
+            debug!(
+                logger,
+                "Trigger data had duplicate triggers";
+                "block_number" => block.number(),
+                "block_hash" => block.hash().hash_hex(),
+                "old_length" => old_len,
+                "new_length" => new_len,
+            );
+        }
+
         Self {
             block,
             trigger_data,
@@ -111,6 +225,10 @@ impl<C: Blockchain> BlockWithTriggers<C> {
     pub fn ptr(&self) -> BlockPtr {
         self.block.ptr()
     }
+
+    pub fn parent_ptr(&self) -> Option<BlockPtr> {
+        self.block.parent_ptr()
+    }
 }
 
 #[async_trait]
@@ -119,8 +237,11 @@ pub trait TriggersAdapter<C: Blockchain>: Send + Sync {
     // by `ptr` from the local cache. An offset of 0 means the block itself,
     // an offset of 1 means the block's parent etc. If the block is not in
     // the local cache, return `None`
-    fn ancestor_block(&self, ptr: BlockPtr, offset: BlockNumber)
-        -> Result<Option<C::Block>, Error>;
+    async fn ancestor_block(
+        &self,
+        ptr: BlockPtr,
+        offset: BlockNumber,
+    ) -> Result<Option<C::Block>, Error>;
 
     // Returns a sequence of blocks in increasing order of block number.
     // Each block will include all of its triggers that match the given `filter`.
@@ -157,42 +278,116 @@ pub trait FirehoseMapper<C: Blockchain>: Send + Sync {
         &self,
         logger: &Logger,
         response: &firehose::Response,
-        adapter: &C::TriggersAdapter,
+        adapter: &Arc<dyn TriggersAdapter<C>>,
         filter: &C::TriggerFilter,
     ) -> Result<BlockStreamEvent<C>, FirehoseError>;
+
+    /// Returns the [BlockPtr] value for this given block number. This is the block pointer
+    /// of the longuest according to Firehose view of the blockchain state.
+    ///
+    /// This is a thin wrapper around [FirehoseEndpoint#block_ptr_for_number] to make
+    /// it chain agnostic and callable from chain agnostic [FirehoseBlockStream].
+    async fn block_ptr_for_number(
+        &self,
+        logger: &Logger,
+        endpoint: &Arc<FirehoseEndpoint>,
+        number: BlockNumber,
+    ) -> Result<BlockPtr, Error>;
+
+    /// Returns the closest final block ptr to the block ptr received.
+    /// On probablitics chain like Ethereum, final is determined by
+    /// the confirmations threshold configured for the Firehose stack (currently
+    /// hard-coded to 200).
+    ///
+    /// On some other chain like NEAR, the actual final block number is determined
+    /// from the block itself since it contains information about which block number
+    /// is final against the current block.
+    ///
+    /// To take an example, assuming we are on Ethereum, the final block pointer
+    /// for block #10212 would be the determined final block #10012 (10212 - 200 = 10012).
+    async fn final_block_ptr_for(
+        &self,
+        logger: &Logger,
+        endpoint: &Arc<FirehoseEndpoint>,
+        block: &C::Block,
+    ) -> Result<BlockPtr, Error>;
+}
+
+#[async_trait]
+pub trait SubstreamsMapper<C: Blockchain>: Send + Sync {
+    async fn to_block_stream_event(
+        &self,
+        logger: &Logger,
+        response: &BlockScopedData,
+        // adapter: &Arc<dyn TriggersAdapter<C>>,
+        // filter: &C::TriggerFilter,
+    ) -> Result<Option<BlockStreamEvent<C>>, SubstreamsError>;
 }
 
 #[derive(Error, Debug)]
 pub enum FirehoseError {
     /// We were unable to decode the received block payload into the chain specific Block struct (e.g. chain_ethereum::pb::Block)
-    #[error("received gRPC block payload cannot be decoded")]
+    #[error("received gRPC block payload cannot be decoded: {0}")]
     DecodingError(#[from] prost::DecodeError),
 
-    /// Some unknown error occured
+    /// Some unknown error occurred
     #[error("unknown error")]
     UnknownError(#[from] anyhow::Error),
 }
 
+#[derive(Error, Debug)]
+pub enum SubstreamsError {
+    #[error("response is missing the clock information")]
+    MissingClockError,
+    /// We were unable to decode the received block payload into the chain specific Block struct (e.g. chain_ethereum::pb::Block)
+    #[error("received gRPC block payload cannot be decoded: {0}")]
+    DecodingError(#[from] prost::DecodeError),
+
+    /// Some unknown error occurred
+    #[error("unknown error")]
+    UnknownError(#[from] anyhow::Error),
+
+    #[error("multiple module output error")]
+    MultipleModuleOutputError,
+
+    #[error("module output was not available (none) or wrong data provided")]
+    ModuleOutputNotPresentOrUnexpected,
+
+    #[error("unexpected store delta output")]
+    UnexpectedStoreDeltaOutput,
+}
+
+#[derive(Debug)]
 pub enum BlockStreamEvent<C: Blockchain> {
-    // The payload is the current subgraph head pointer, which should be reverted, such that the
-    // parent of the current subgraph head becomes the new subgraph head.
-    // An optional pointer to the parent block will save a round trip operation when reverting.
-    Revert(BlockPtr, BlockPtr, FirehoseCursor),
+    // The payload is the block the subgraph should revert to, so it becomes the new subgraph head.
+    Revert(BlockPtr, FirehoseCursor),
 
     ProcessBlock(BlockWithTriggers<C>, FirehoseCursor),
+}
+
+impl<C: Blockchain> Clone for BlockStreamEvent<C>
+where
+    C::TriggerData: Clone,
+{
+    fn clone(&self) -> Self {
+        match self {
+            Self::Revert(arg0, arg1) => Self::Revert(arg0.clone(), arg1.clone()),
+            Self::ProcessBlock(arg0, arg1) => Self::ProcessBlock(arg0.clone(), arg1.clone()),
+        }
+    }
 }
 
 #[derive(Clone)]
 pub struct BlockStreamMetrics {
     pub deployment_head: Box<Gauge>,
     pub deployment_failed: Box<Gauge>,
-    pub reverted_blocks: Box<Gauge>,
+    pub reverted_blocks: Gauge,
     pub stopwatch: StopwatchMetrics,
 }
 
 impl BlockStreamMetrics {
     pub fn new(
-        registry: Arc<impl MetricsRegistry>,
+        registry: Arc<dyn MetricsRegistry>,
         deployment_id: &DeploymentHash,
         network: String,
         shard: String,
@@ -256,7 +451,9 @@ mod test {
         ext::futures::{CancelableError, SharedCancelGuard, StreamExtension},
     };
 
-    use super::{BlockStream, BlockStreamEvent, BlockWithTriggers, BufferedBlockStream};
+    use super::{
+        BlockStream, BlockStreamEvent, BlockWithTriggers, BufferedBlockStream, FirehoseCursor,
+    };
 
     #[derive(Debug)]
     struct TestStream {
@@ -280,7 +477,7 @@ mod test {
                     },
                     trigger_data: vec![],
                 },
-                None,
+                FirehoseCursor::None,
             ))))
         }
     }
@@ -303,7 +500,7 @@ mod test {
         let mut count = 0;
         loop {
             match stream.next().await {
-                None if blocks.len() == 0 => panic!("None before blocks"),
+                None if blocks.is_empty() => panic!("None before blocks"),
                 Some(Err(CancelableError::Cancel)) => {
                     assert!(guard.is_canceled(), "Guard shouldn't be called yet");
 

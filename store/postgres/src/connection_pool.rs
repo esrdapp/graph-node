@@ -10,6 +10,7 @@ use graph::cheap_clone::CheapClone;
 use graph::constraint_violation;
 use graph::prelude::tokio;
 use graph::prelude::tokio::time::Instant;
+use graph::slog::warn;
 use graph::util::timed_rw_lock::TimedMutex;
 use graph::{
     prelude::{
@@ -17,15 +18,14 @@ use graph::{
         crit, debug, error, info, o,
         tokio::sync::Semaphore,
         CancelGuard, CancelHandle, CancelToken as _, CancelableError, Counter, Gauge, Logger,
-        MetricsRegistry, MovingStats, PoolWaitStats, StoreError,
+        MetricsRegistry, MovingStats, PoolWaitStats, StoreError, ENV_VARS,
     },
     util::security::SafeDisplay,
 };
 
 use std::fmt::{self, Write};
-use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{collections::HashMap, sync::RwLock};
 
@@ -34,47 +34,6 @@ use postgres::config::{Config, Host};
 use crate::primary::{self, NAMESPACE_PUBLIC};
 use crate::{advisory_lock, catalog};
 use crate::{Shard, PRIMARY_SHARD};
-
-lazy_static::lazy_static! {
-    // There is typically no need to configure this. But this can be used to effectivey disable the
-    // query semaphore by setting it to a high number.
-    static ref EXTRA_QUERY_PERMITS: usize = {
-        std::env::var("GRAPH_EXTRA_QUERY_PERMITS")
-            .ok()
-            .map(|s| {
-                usize::from_str(&s).unwrap_or_else(|_| {
-                    panic!("GRAPH_EXTRA_QUERY_PERMITS must be a number, but is `{}`", s)
-                })
-            })
-            .unwrap_or(0)
-    };
-
-    // These environment variables should really be set through the
-    // configuration file; especially for min_idle and idle_timeout, it's
-    // likely that they should be configured differently for each pool
-
-    static ref CONNECTION_TIMEOUT: Duration = {
-        std::env::var("GRAPH_STORE_CONNECTION_TIMEOUT").ok().map(|s| Duration::from_millis(u64::from_str(&s).unwrap_or_else(|_| {
-            panic!("GRAPH_STORE_CONNECTION_TIMEOUT must be a positive number, but is `{}`", s)
-        }))).unwrap_or(Duration::from_secs(5))
-    };
-    static ref MIN_IDLE: Option<u32> = {
-        std::env::var("GRAPH_STORE_CONNECTION_MIN_IDLE").ok().map(|s| u32::from_str(&s).unwrap_or_else(|_| {
-           panic!("GRAPH_STORE_CONNECTION_MIN_IDLE must be a positive number but is `{}`", s)
-        }))
-    };
-    static ref IDLE_TIMEOUT: Duration = {
-        std::env::var("GRAPH_STORE_CONNECTION_IDLE_TIMEOUT").ok().map(|s| Duration::from_secs(u64::from_str(&s).unwrap_or_else(|_| {
-            panic!("GRAPH_STORE_CONNECTION_IDLE_TIMEOUT must be a positive number, but is `{}`", s)
-        }))).unwrap_or(Duration::from_secs(600))
-    };
-    // A fallback in case the logic to remember database availability goes
-    // wrong; when this is set, we always try to get a connection and never
-    // use the availability state we remembered
-    static ref TRY_ALWAYS: bool = {
-        std::env::var("GRAPH_STORE_CONNECTION_TRY_ALWAYS").ok().map(|_| true).unwrap_or(false)
-    };
-}
 
 pub struct ForeignServer {
     pub name: String,
@@ -127,10 +86,15 @@ impl ForeignServer {
         let password = String::from_utf8(
             config
                 .get_password()
-                .ok_or_else(|| anyhow!("could not find user in `{}`", SafeDisplay(postgres_url)))?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "could not find password in `{}`; you must provide one.",
+                        SafeDisplay(postgres_url)
+                    )
+                })?
                 .into(),
         )?;
-        let port = config.get_ports().get(0).cloned().unwrap_or(5432u16);
+        let port = config.get_ports().first().cloned().unwrap_or(5432u16);
         let dbname = config
             .get_dbname()
             .map(|s| s.to_string())
@@ -199,9 +163,6 @@ impl ForeignServer {
 
     /// Map key tables from the primary into our local schema. If we are the
     /// primary, set them up as views.
-    ///
-    /// We recreate this mapping on every server start so that migrations that
-    /// change one of the mapped tables actually show up in the imported tables
     fn map_primary(conn: &PgConnection, shard: &Shard) -> Result<(), StoreError> {
         catalog::recreate_schema(conn, Self::PRIMARY_PUBLIC)?;
 
@@ -267,9 +228,11 @@ const FDW_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 enum PoolState {
     /// A connection pool, and all the servers for which we need to
     /// establish fdw mappings when we call `setup` on the pool
-    Created(Arc<PoolInner>, Arc<Vec<ForeignServer>>),
+    Created(Arc<PoolInner>, Arc<PoolCoordinator>),
     /// The pool has been successfully set up
     Ready(Arc<PoolInner>),
+    /// The pool has been disabled by setting its size to 0
+    Disabled,
 }
 
 #[derive(Clone)]
@@ -339,7 +302,7 @@ impl PoolStateTracker {
 }
 
 impl ConnectionPool {
-    pub fn create(
+    fn create(
         shard_name: &str,
         pool_name: PoolName,
         postgres_url: String,
@@ -347,24 +310,31 @@ impl ConnectionPool {
         fdw_pool_size: Option<u32>,
         logger: &Logger,
         registry: Arc<dyn MetricsRegistry>,
-        servers: Arc<Vec<ForeignServer>>,
+        coord: Arc<PoolCoordinator>,
     ) -> ConnectionPool {
         let state_tracker = PoolStateTracker::new();
-        let pool = PoolInner::create(
-            shard_name,
-            pool_name.as_str(),
-            postgres_url,
-            pool_size,
-            fdw_pool_size,
-            logger,
-            registry,
-            state_tracker.clone(),
-        );
-        let shard = pool.shard.clone();
-        let pool_state = if pool_name.is_replica() {
-            PoolState::Ready(Arc::new(pool))
-        } else {
-            PoolState::Created(Arc::new(pool), servers)
+        let shard =
+            Shard::new(shard_name.to_string()).expect("shard_name is a valid name for a shard");
+        let pool_state = {
+            if pool_size == 0 {
+                PoolState::Disabled
+            } else {
+                let pool = PoolInner::create(
+                    shard.clone(),
+                    pool_name.as_str(),
+                    postgres_url,
+                    pool_size,
+                    fdw_pool_size,
+                    logger,
+                    registry,
+                    state_tracker.clone(),
+                );
+                if pool_name.is_replica() {
+                    PoolState::Ready(Arc::new(pool))
+                } else {
+                    PoolState::Created(Arc::new(pool), coord)
+                }
+            }
         };
         ConnectionPool {
             inner: Arc::new(TimedMutex::new(pool_state, format!("pool-{}", shard_name))),
@@ -380,7 +350,7 @@ impl ConnectionPool {
         let mut guard = self.inner.lock(&self.logger);
         match &*guard {
             PoolState::Created(pool, _) => *guard = PoolState::Ready(pool.clone()),
-            PoolState::Ready(_) => { /* nothing to do */ }
+            PoolState::Ready(_) | PoolState::Disabled => { /* nothing to do */ }
         }
     }
 
@@ -390,7 +360,7 @@ impl ConnectionPool {
     /// `StoreError::DatabaseUnavailable`
     fn get_ready(&self) -> Result<Arc<PoolInner>, StoreError> {
         let mut guard = self.inner.lock(&self.logger);
-        if !self.state_tracker.is_available() && !*TRY_ALWAYS {
+        if !self.state_tracker.is_available() && !ENV_VARS.store.connection_try_always {
             // We know that trying to use this pool is pointless since the
             // database is not available, and will only lead to other
             // operations having to wait until the connection timeout is
@@ -408,6 +378,7 @@ impl ConnectionPool {
                 Ok(pool2)
             }
             PoolState::Ready(pool) => Ok(pool.clone()),
+            PoolState::Disabled => Err(StoreError::DatabaseDisabled),
         }
     }
 
@@ -513,16 +484,22 @@ impl ConnectionPool {
         .unwrap();
     }
 
-    pub(crate) async fn query_permit(&self) -> tokio::sync::OwnedSemaphorePermit {
+    pub(crate) async fn query_permit(
+        &self,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, StoreError> {
         let pool = match &*self.inner.lock(&self.logger) {
             PoolState::Created(pool, _) | PoolState::Ready(pool) => pool.clone(),
+            PoolState::Disabled => {
+                return Err(StoreError::DatabaseDisabled);
+            }
         };
-        pool.query_permit().await
+        Ok(pool.query_permit().await)
     }
 
-    pub(crate) fn wait_stats(&self) -> PoolWaitStats {
+    pub(crate) fn wait_stats(&self) -> Result<PoolWaitStats, StoreError> {
         match &*self.inner.lock(&self.logger) {
-            PoolState::Created(pool, _) | PoolState::Ready(pool) => pool.wait_stats.clone(),
+            PoolState::Created(pool, _) | PoolState::Ready(pool) => Ok(pool.wait_stats.clone()),
+            PoolState::Disabled => Err(StoreError::DatabaseDisabled),
         }
     }
 
@@ -546,7 +523,7 @@ fn brief_error_msg(error: &dyn std::error::Error) -> String {
     // Connection refused.."))`
     error
         .to_string()
-        .split("\n")
+        .split('\n')
         .next()
         .unwrap_or("no error details provided")
         .to_string()
@@ -640,7 +617,7 @@ impl EventHandler {
             .global_gauge(
                 "store_connection_pool_size_count",
                 "Overall size of the connection pool",
-                const_labels.clone(),
+                const_labels,
             )
             .expect("failed to create `store_connection_pool_size_count` counter");
         EventHandler {
@@ -701,7 +678,7 @@ impl HandleEvent for EventHandler {
 #[derive(Clone)]
 pub struct PoolInner {
     logger: Logger,
-    shard: Shard,
+    pub shard: Shard,
     pool: Pool<ConnectionManager<PgConnection>>,
     // A separate pool for connections that will use foreign data wrappers.
     // Once such a connection accesses a foreign table, Postgres keeps a
@@ -729,7 +706,7 @@ pub struct PoolInner {
 
 impl PoolInner {
     fn create(
-        shard_name: &str,
+        shard: Shard,
         pool_name: &str,
         postgres_url: String,
         pool_size: u32,
@@ -743,14 +720,14 @@ impl PoolInner {
         let const_labels = {
             let mut map = HashMap::new();
             map.insert("pool".to_owned(), pool_name.to_owned());
-            map.insert("shard".to_string(), shard_name.to_owned());
+            map.insert("shard".to_string(), shard.to_string());
             map
         };
         let error_counter = registry
             .global_counter(
                 "store_connection_error_count",
                 "The number of Postgres connections errors",
-                HashMap::new(),
+                const_labels.clone(),
             )
             .expect("failed to create `store_connection_error_count` counter");
         let error_handler = Box::new(ErrorHandler::new(
@@ -769,20 +746,33 @@ impl PoolInner {
 
         // Connect to Postgres
         let conn_manager = ConnectionManager::new(postgres_url.clone());
+        let min_idle = ENV_VARS.store.connection_min_idle.filter(|min_idle| {
+            if *min_idle <= pool_size {
+                true
+            } else {
+                warn!(
+                    logger_pool,
+                    "Configuration error: min idle {} exceeds pool size {}, ignoring min idle",
+                    min_idle,
+                    pool_size
+                );
+                false
+            }
+        });
         let builder: Builder<ConnectionManager<PgConnection>> = Pool::builder()
             .error_handler(error_handler.clone())
             .event_handler(event_handler.clone())
-            .connection_timeout(*CONNECTION_TIMEOUT)
+            .connection_timeout(ENV_VARS.store.connection_timeout)
             .max_size(pool_size)
-            .min_idle(*MIN_IDLE)
-            .idle_timeout(Some(*IDLE_TIMEOUT));
+            .min_idle(min_idle)
+            .idle_timeout(Some(ENV_VARS.store.connection_idle_timeout));
         let pool = builder.build_unchecked(conn_manager);
         let fdw_pool = fdw_pool_size.map(|pool_size| {
             let conn_manager = ConnectionManager::new(postgres_url.clone());
             let builder: Builder<ConnectionManager<PgConnection>> = Pool::builder()
                 .error_handler(error_handler)
                 .event_handler(event_handler)
-                .connection_timeout(*CONNECTION_TIMEOUT)
+                .connection_timeout(ENV_VARS.store.connection_timeout)
                 .max_size(pool_size)
                 .min_idle(Some(1))
                 .idle_timeout(Some(FDW_IDLE_TIMEOUT));
@@ -799,13 +789,12 @@ impl PoolInner {
                 const_labels,
             )
             .expect("failed to create `query_effort_ms` counter");
-        let max_concurrent_queries = pool_size as usize + *EXTRA_QUERY_PERMITS;
+        let max_concurrent_queries = pool_size as usize + ENV_VARS.store.extra_query_permits;
         let query_semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent_queries));
         PoolInner {
             logger: logger_pool,
-            shard: Shard::new(shard_name.to_string())
-                .expect("shard_name is a valid name for a shard"),
-            postgres_url: postgres_url.clone(),
+            shard,
+            postgres_url,
             pool,
             fdw_pool,
             limiter,
@@ -913,7 +902,7 @@ impl PoolInner {
         logger: &Logger,
     ) -> Result<PooledConnection<ConnectionManager<PgConnection>>, StoreError> {
         loop {
-            match self.pool.get_timeout(*CONNECTION_TIMEOUT) {
+            match self.pool.get_timeout(ENV_VARS.store.connection_timeout) {
                 Ok(conn) => return Ok(conn),
                 Err(e) => error!(logger, "Error checking out connection, retrying";
                    "error" => brief_error_msg(&e),
@@ -981,26 +970,63 @@ impl PoolInner {
     /// # Panics
     ///
     /// If any errors happen during the migration, the process panics
-    pub fn setup(&self, servers: Arc<Vec<ForeignServer>>) -> Result<(), StoreError> {
+    fn setup(&self, coord: Arc<PoolCoordinator>) -> Result<(), StoreError> {
         fn die(logger: &Logger, msg: &'static str, err: &dyn std::fmt::Display) -> ! {
-            crit!(logger, "{}", msg; "error" => err.to_string());
+            crit!(logger, "{}", msg; "error" => format!("{:#}", err));
             panic!("{}: {}", msg, err);
         }
 
         let pool = self.clone();
         let conn = self.get().map_err(|_| StoreError::DatabaseUnavailable)?;
 
+        let start = Instant::now();
+
         advisory_lock::lock_migration(&conn)
             .unwrap_or_else(|err| die(&pool.logger, "failed to get migration lock", &err));
+        // This code can cause a race in database setup: if pool A has had
+        // schema changes and pool B then tries to map tables from pool A,
+        // but does so before the concurrent thread running this code for
+        // pool B has at least finished `configure_fdw`, mapping tables will
+        // fail. In that case, the node must be restarted. The restart is
+        // guaranteed because this failure will lead to a panic in the setup
+        // for pool A
+        //
+        // This code can also leave the table mappings in a state where they
+        // have not been updated if the process is killed after migrating
+        // the schema but before finishing remapping in all shards.
+        // Addressing that would require keeping track of the need to remap
+        // in the database instead of just in memory
         let result = pool
-            .configure_fdw(servers.as_ref())
+            .configure_fdw(coord.servers.as_ref())
             .and_then(|()| migrate_schema(&pool.logger, &conn))
-            .and_then(|()| pool.map_primary())
-            .and_then(|()| pool.map_metadata(servers.as_ref()));
+            .and_then(|had_migrations| {
+                if had_migrations {
+                    coord.propagate_schema_change(&self.shard)
+                } else {
+                    Ok(())
+                }
+            });
+        debug!(&pool.logger, "Release migration lock");
         advisory_lock::unlock_migration(&conn).unwrap_or_else(|err| {
             die(&pool.logger, "failed to release migration lock", &err);
         });
         result.unwrap_or_else(|err| die(&pool.logger, "migrations failed", &err));
+
+        // Locale check
+        if let Err(msg) = catalog::Locale::load(&conn)?.suitable() {
+            if &self.shard == &*PRIMARY_SHARD && primary::is_empty(&conn)? {
+                die(
+                    &pool.logger,
+                    "Database does not use C locale. \
+                    Please check the graph-node documentation for how to set up the database locale",
+                    &msg,
+                );
+            } else {
+                warn!(pool.logger, "{}.\nPlease check the graph-node documentation for how to set up the database locale", msg);
+            }
+        }
+
+        debug!(&pool.logger, "Setup finished"; "setup_time_s" => start.elapsed().as_secs());
         Ok(())
     }
 
@@ -1014,7 +1040,7 @@ impl PoolInner {
         permit.unwrap()
     }
 
-    fn configure_fdw(&self, servers: &Vec<ForeignServer>) -> Result<(), StoreError> {
+    fn configure_fdw(&self, servers: &[ForeignServer]) -> Result<(), StoreError> {
         info!(&self.logger, "Setting up fdw");
         let conn = self.get()?;
         conn.batch_execute("create extension if not exists postgres_fdw")?;
@@ -1031,42 +1057,39 @@ impl PoolInner {
         })
     }
 
-    /// Map key tables from the primary into our local schema. If we are the
-    /// primary, set them up as views.
-    ///
-    /// We recreate this mapping on every server start so that migrations that
-    /// change one of the mapped tables actually show up in the imported tables
-    fn map_primary(&self) -> Result<(), StoreError> {
-        info!(&self.logger, "Mapping primary");
-        let conn = self.get()?;
-        conn.transaction(|| ForeignServer::map_primary(&conn, &self.shard))
-    }
-
     /// Copy the data from key tables in the primary into our local schema
     /// so it can be used as a fallback when the primary goes down
     pub async fn mirror_primary_tables(&self) -> Result<(), StoreError> {
-        if &self.shard == &*PRIMARY_SHARD {
+        if self.shard == *PRIMARY_SHARD {
             return Ok(());
         }
         self.with_conn(|conn, handle| {
             conn.transaction(|| {
-                primary::Mirror::refresh_tables(&conn, handle).map_err(CancelableError::from)
+                primary::Mirror::refresh_tables(conn, handle).map_err(CancelableError::from)
             })
         })
         .await
     }
 
-    // Map some tables from the `subgraphs` metadata schema from foreign
-    // servers to ourselves. The mapping is recreated on every server start
-    // so that we pick up possible schema changes in the mappings
-    fn map_metadata(&self, servers: &Vec<ForeignServer>) -> Result<(), StoreError> {
-        let conn = self.get()?;
-        conn.transaction(|| {
-            for server in servers.iter().filter(|server| server.shard != self.shard) {
-                server.map_metadata(&conn)?;
-            }
-            Ok(())
-        })
+    // The foreign server `server` had schema changes, and we therefore need
+    // to remap anything that we are importing via fdw to make sure we are
+    // using this updated schema
+    pub fn remap(&self, server: &ForeignServer) -> Result<(), StoreError> {
+        if &server.shard == &*PRIMARY_SHARD {
+            info!(&self.logger, "Mapping primary");
+            let conn = self.get()?;
+            conn.transaction(|| ForeignServer::map_primary(&conn, &self.shard))?;
+        }
+        if &server.shard != &self.shard {
+            info!(
+                &self.logger,
+                "Mapping metadata from {}",
+                server.shard.as_str()
+            );
+            let conn = self.get()?;
+            conn.transaction(|| server.map_metadata(&conn))?;
+        }
+        Ok(())
     }
 }
 
@@ -1077,19 +1100,22 @@ embed_migrations!("./migrations");
 /// When multiple `graph-node` processes start up at the same time, we ensure
 /// that they do not run migrations in parallel by using `blocking_conn` to
 /// serialize them. The `conn` is used to run the actual migration.
-fn migrate_schema(logger: &Logger, conn: &PgConnection) -> Result<(), StoreError> {
+fn migrate_schema(logger: &Logger, conn: &PgConnection) -> Result<bool, StoreError> {
     // Collect migration logging output
     let mut output = vec![];
+
+    let old_count = catalog::migration_count(conn)?;
 
     info!(logger, "Running migrations");
     let result = embedded_migrations::run_with_output(conn, &mut output);
     info!(logger, "Migrations finished");
 
+    let had_migrations = catalog::migration_count(conn)? != old_count;
+
     // If there was any migration output, log it now
     let msg = String::from_utf8(output).unwrap_or_else(|_| String::from("<unreadable>"));
     let msg = msg.trim();
-    let has_output = !msg.is_empty();
-    if has_output {
+    if !msg.is_empty() {
         let msg = msg.replace('\n', " ");
         if let Err(e) = result {
             error!(logger, "Postgres migration error"; "output" => msg);
@@ -1099,13 +1125,98 @@ fn migrate_schema(logger: &Logger, conn: &PgConnection) -> Result<(), StoreError
         }
     }
 
-    if has_output {
-        // We take getting output as a signal that a migration was actually
-        // run, which is not easy to tell from the Diesel API, and reset the
-        // query statistics since a schema change makes them not all that
-        // useful. An error here is not serious and can be ignored.
+    if had_migrations {
+        // Reset the query statistics since a schema change makes them not
+        // all that useful. An error here is not serious and can be ignored.
         conn.batch_execute("select pg_stat_statements_reset()").ok();
     }
 
-    Ok(())
+    Ok(had_migrations)
+}
+
+/// Helper to coordinate propagating schema changes from the database that
+/// changes schema to all other shards so they can update their fdw mappings
+/// of tables imported from that shard
+pub struct PoolCoordinator {
+    pools: Mutex<HashMap<Shard, Arc<PoolInner>>>,
+    servers: Arc<Vec<ForeignServer>>,
+}
+
+impl PoolCoordinator {
+    pub fn new(servers: Arc<Vec<ForeignServer>>) -> Self {
+        Self {
+            pools: Mutex::new(HashMap::new()),
+            servers,
+        }
+    }
+
+    pub fn create_pool(
+        self: Arc<Self>,
+        logger: &Logger,
+        name: &str,
+        pool_name: PoolName,
+        postgres_url: String,
+        pool_size: u32,
+        fdw_pool_size: Option<u32>,
+        registry: Arc<dyn MetricsRegistry>,
+    ) -> ConnectionPool {
+        let is_writable = !pool_name.is_replica();
+
+        let pool = ConnectionPool::create(
+            name,
+            pool_name,
+            postgres_url,
+            pool_size,
+            fdw_pool_size,
+            logger,
+            registry,
+            self.cheap_clone(),
+        );
+
+        // Ignore non-writable pools (replicas), there is no need (and no
+        // way) to coordinate schema changes with them
+        if is_writable {
+            // It is safe to take this lock here since nobody has seen the pool
+            // yet. We remember the `PoolInner` so that later, when we have to
+            // call `remap()`, we do not have to take this lock as that will be
+            // already held in `get_ready()`
+            match &*pool.inner.lock(logger) {
+                PoolState::Created(inner, _) | PoolState::Ready(inner) => {
+                    self.pools
+                        .lock()
+                        .unwrap()
+                        .insert(pool.shard.clone(), inner.clone());
+                }
+                PoolState::Disabled => { /* nothing to do */ }
+            }
+        }
+        pool
+    }
+
+    /// Propagate changes to the schema in `shard` to all other pools. Those
+    /// other pools will then recreate any tables that they imported from
+    /// `shard`
+    fn propagate_schema_change(&self, shard: &Shard) -> Result<(), StoreError> {
+        let server = self
+            .servers
+            .iter()
+            .find(|server| &server.shard == shard)
+            .ok_or_else(|| constraint_violation!("unknown shard {shard}"))?;
+
+        for pool in self.pools.lock().unwrap().values() {
+            if let Err(e) = pool.remap(server) {
+                error!(pool.logger, "Failed to map imports from {}", server.shard; "error" => e.to_string());
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn pools(&self) -> Vec<Arc<PoolInner>> {
+        self.pools.lock().unwrap().values().cloned().collect()
+    }
+
+    pub fn servers(&self) -> Arc<Vec<ForeignServer>> {
+        self.servers.clone()
+    }
 }

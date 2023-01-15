@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Context};
 use graph::cheap_clone::CheapClone;
 use graph::prelude::rand::{self, seq::IteratorRandom};
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -15,6 +16,11 @@ use crate::EthereumAdapter;
 pub struct EthereumNetworkAdapter {
     pub capabilities: NodeCapabilities,
     adapter: Arc<EthereumAdapter>,
+    /// The maximum number of times this adapter can be used. We use the
+    /// strong_count on `adapter` to determine whether the adapter is above
+    /// that limit. That's a somewhat imprecise but convenient way to
+    /// determine the number of connections
+    limit: usize,
 }
 
 #[derive(Clone)]
@@ -23,22 +29,30 @@ pub struct EthereumNetworkAdapters {
 }
 
 impl EthereumNetworkAdapters {
-    pub fn cheapest_with(
+    pub fn all_cheapest_with(
         &self,
         required_capabilities: &NodeCapabilities,
-    ) -> Result<Arc<EthereumAdapter>, Error> {
+    ) -> impl Iterator<Item = Arc<EthereumAdapter>> + '_ {
         let cheapest_sufficient_capability = self
             .adapters
             .iter()
             .find(|adapter| &adapter.capabilities >= required_capabilities)
             .map(|adapter| &adapter.capabilities);
 
-        // Select randomly from the cheapest adapters that have sufficent capabilities.
         self.adapters
             .iter()
-            .filter(|adapter| Some(&adapter.capabilities) == cheapest_sufficient_capability)
-            .choose(&mut rand::thread_rng())
+            .filter(move |adapter| Some(&adapter.capabilities) == cheapest_sufficient_capability)
+            .filter(|adapter| Arc::strong_count(&adapter.adapter) < adapter.limit)
             .map(|adapter| adapter.adapter.cheap_clone())
+    }
+
+    pub fn cheapest_with(
+        &self,
+        required_capabilities: &NodeCapabilities,
+    ) -> Result<Arc<EthereumAdapter>, Error> {
+        // Select randomly from the cheapest adapters that have sufficent capabilities.
+        self.all_cheapest_with(required_capabilities)
+            .choose(&mut rand::thread_rng())
             .with_context(|| {
                 anyhow!(
                     "A matching Ethereum network with {:?} was not found.",
@@ -51,8 +65,7 @@ impl EthereumNetworkAdapters {
         // EthereumAdapters are sorted by their NodeCapabilities when the EthereumNetworks
         // struct is instantiated so they do not need to be sorted here
         self.adapters
-            .iter()
-            .next()
+            .first()
             .map(|ethereum_network_adapter| ethereum_network_adapter.adapter.clone())
     }
 
@@ -79,6 +92,7 @@ impl EthereumNetworks {
         name: String,
         capabilities: NodeCapabilities,
         adapter: Arc<EthereumAdapter>,
+        limit: usize,
     ) {
         let network_adapters = self
             .networks
@@ -86,7 +100,8 @@ impl EthereumNetworks {
             .or_insert(EthereumNetworkAdapters { adapters: vec![] });
         network_adapters.adapters.push(EthereumNetworkAdapter {
             capabilities,
-            adapter: adapter.clone(),
+            adapter,
+            limit,
         });
     }
 
@@ -120,9 +135,14 @@ impl EthereumNetworks {
 
     pub fn sort(&mut self) {
         for adapters in self.networks.values_mut() {
-            adapters
-                .adapters
-                .sort_by_key(|adapter| adapter.capabilities)
+            adapters.adapters.sort_by(|a, b| {
+                a.capabilities
+                    .partial_cmp(&b.capabilities)
+                    // We can't define a total ordering over node capabilities,
+                    // so incomparable items are considered equal and end up
+                    // near each other.
+                    .unwrap_or(Ordering::Equal)
+            })
         }
     }
 

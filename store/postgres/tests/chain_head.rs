@@ -1,13 +1,14 @@
 //! Test ChainStore implementation of Store, in particular, how
 //! the chain head pointer gets updated in various situations
 
+use futures::executor;
 use std::future::Future;
 use std::sync::Arc;
 
 use graph::prelude::web3::types::H256;
 use graph::prelude::{anyhow::anyhow, anyhow::Error};
 use graph::prelude::{serde_json as json, EthereumBlock};
-use graph::prelude::{BlockNumber, QueryStoreManager};
+use graph::prelude::{BlockNumber, QueryStoreManager, QueryTarget};
 use graph::{cheap_clone::CheapClone, prelude::web3::types::H160};
 use graph::{components::store::BlockStore as _, prelude::DeploymentHash};
 use graph::{components::store::ChainStore as _, prelude::EthereumCallCache as _};
@@ -31,14 +32,14 @@ where
     F: Fn(Arc<DieselChainStore>, Arc<DieselStore>) -> Result<(), Error> + Send + 'static,
 {
     run_test_sequentially(|store| async move {
-        for name in vec![NETWORK_NAME, FAKE_NETWORK_SHARED] {
+        for name in &[NETWORK_NAME, FAKE_NETWORK_SHARED] {
             block_store::set_chain(chain.clone(), name);
 
             let chain_store = store.block_store().chain_store(name).expect("chain store");
 
             // Run test
             test(chain_store.cheap_clone(), store.cheap_clone())
-                .expect(&format!("test finishes successfully on network {}", name));
+                .unwrap_or_else(|_| panic!("test finishes successfully on network {}", name));
         }
     });
 }
@@ -49,7 +50,7 @@ where
     R: Future<Output = ()> + Send + 'static,
 {
     run_test_sequentially(|store| async move {
-        for name in vec![NETWORK_NAME, FAKE_NETWORK_SHARED] {
+        for name in &[NETWORK_NAME, FAKE_NETWORK_SHARED] {
             block_store::set_chain(chain.clone(), name);
 
             let chain_store = store.block_store().chain_store(name).expect("chain store");
@@ -85,6 +86,7 @@ fn check_chain_head_update(
         let head_hash_exp = head_exp.map(|block| block.hash.clone());
         let head_hash_act = store
             .chain_head_ptr()
+            .await
             .expect("chain_head_ptr failed")
             .map(|ebp| ebp.hash_hex());
         assert_eq!(head_hash_exp, head_hash_act);
@@ -121,7 +123,7 @@ fn genesis_plus_one_with_sibling() {
 #[test]
 fn short_chain_missing_parent() {
     let chain = vec![&*BLOCK_ONE_NO_PARENT];
-    check_chain_head_update(chain, None, Some(&NO_PARENT));
+    check_chain_head_update(chain, None, Some(NO_PARENT));
 }
 
 #[test]
@@ -165,32 +167,38 @@ fn long_chain_with_uncles() {
 }
 
 #[test]
-fn block_number() {
+fn test_get_block_number() {
     let chain = vec![&*GENESIS_BLOCK, &*BLOCK_ONE, &*BLOCK_TWO];
     let subgraph = DeploymentHash::new("nonExistentSubgraph").unwrap();
 
     run_test_async(chain, move |_, subgraph_store| {
         let subgraph = subgraph.cheap_clone();
         async move {
-            create_test_subgraph(&subgraph, "type Dummy @entity { id: ID! }");
+            create_test_subgraph(&subgraph, "type Dummy @entity { id: ID! }").await;
 
             let query_store = subgraph_store
-                .query_store(subgraph.cheap_clone().into(), false)
+                .query_store(
+                    QueryTarget::Deployment(subgraph.cheap_clone(), Default::default()),
+                    false,
+                )
                 .await
                 .unwrap();
 
             let block = query_store
-                .block_number(GENESIS_BLOCK.block_hash())
+                .block_number(&GENESIS_BLOCK.block_hash())
+                .await
                 .expect("Found genesis block");
             assert_eq!(Some(0), block);
 
             let block = query_store
-                .block_number(BLOCK_ONE.block_hash())
+                .block_number(&BLOCK_ONE.block_hash())
+                .await
                 .expect("Found block 1");
             assert_eq!(Some(1), block);
 
             let block = query_store
-                .block_number(BLOCK_THREE.block_hash())
+                .block_number(&BLOCK_THREE.block_hash())
+                .await
                 .expect("Looked for block 3");
             assert!(block.is_none());
         }
@@ -249,11 +257,14 @@ fn check_ancestor(
     offset: BlockNumber,
     exp: &FakeBlock,
 ) -> Result<(), Error> {
-    let act = store
-        .ancestor_block(child.block_ptr(), offset)?
-        .map(json::from_value::<EthereumBlock>)
-        .transpose()?
-        .ok_or_else(|| anyhow!("block {} has no ancestor at offset {}", child.hash, offset))?;
+    let act = executor::block_on(
+        store
+            .cheap_clone()
+            .ancestor_block(child.block_ptr(), offset),
+    )?
+    .map(json::from_value::<EthereumBlock>)
+    .transpose()?
+    .ok_or_else(|| anyhow!("block {} has no ancestor at offset {}", child.hash, offset))?;
     let act_hash = format!("{:x}", act.block.hash.unwrap());
     let exp_hash = &exp.hash;
 
@@ -289,11 +300,15 @@ fn ancestor_block_simple() {
 
         for offset in [6, 7, 8, 50].iter() {
             let offset = *offset;
-            let res = store.ancestor_block(BLOCK_FIVE.block_ptr(), offset);
+            let res = executor::block_on(
+                store
+                    .cheap_clone()
+                    .ancestor_block(BLOCK_FIVE.block_ptr(), offset),
+            );
             assert!(res.is_err());
         }
 
-        let block = store.ancestor_block(BLOCK_TWO_NO_PARENT.block_ptr(), 1)?;
+        let block = executor::block_on(store.ancestor_block(BLOCK_TWO_NO_PARENT.block_ptr(), 1))?;
         assert!(block.is_none());
         Ok(())
     });

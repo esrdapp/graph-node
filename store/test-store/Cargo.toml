@@ -1,8 +1,8 @@
 [package]
 name = "test-store"
-version = "0.25.0"
+version.workspace = true
+edition.workspace = true
 authors = ["Leonardo Yvens <leoyvens@gmail.com>"]
-edition = "2018"
 description = "Provides static store instance for tests."
 
 [dependencies]
@@ -12,7 +12,9 @@ graph-mock = { path = "../../mock" }
 graph-node = { path = "../../node" }
 graph = { path = "../../graph" }
 graph-store-postgres = { path = "../postgres" }
+graph-chain-ethereum= { path = "../../chain/ethereum" }
 lazy_static = "1.1"
 hex-literal = "0.3"
 diesel = { version = "1.4.8", features = ["postgres", "serde_json", "numeric", "r2d2"] }
-graph-chain-ethereum = { path = "../../chain/ethereum" }
+serde = "1.0"
+prost-types = { workspace = true }

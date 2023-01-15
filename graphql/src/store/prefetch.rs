@@ -3,8 +3,9 @@
 
 use anyhow::{anyhow, Error};
 use graph::constraint_violation;
-use graph::data::value::Object;
-use graph::prelude::{r, CacheWeight};
+use graph::data::query::Trace;
+use graph::data::value::{Object, Word};
+use graph::prelude::{r, CacheWeight, CheapClone};
 use graph::slog::warn;
 use graph::util::cache_weight;
 use lazy_static::lazy_static;
@@ -16,14 +17,14 @@ use graph::{components::store::EntityType, data::graphql::*};
 use graph::{
     data::graphql::ext::DirectiveFinder,
     prelude::{
-        s, ApiSchema, AttributeNames, BlockNumber, ChildMultiplicity, EntityCollection,
-        EntityFilter, EntityLink, EntityOrder, EntityWindow, Logger, ParentLink,
-        QueryExecutionError, QueryStore, StoreError, Value as StoreValue, WindowAttribute,
+        s, ApiSchema, AttributeNames, ChildMultiplicity, EntityCollection, EntityFilter,
+        EntityLink, EntityOrder, EntityWindow, ParentLink, QueryExecutionError, StoreError,
+        Value as StoreValue, WindowAttribute, ENV_VARS,
     },
 };
 
 use crate::execution::{ast as a, ExecutionContext, Resolver};
-use crate::runner::ResultSizeMetrics;
+use crate::metrics::GraphQLMetrics;
 use crate::schema::ast as sast;
 use crate::store::query::build_query;
 use crate::store::StoreResolver;
@@ -32,19 +33,6 @@ lazy_static! {
     static ref ARG_FIRST: String = String::from("first");
     static ref ARG_SKIP: String = String::from("skip");
     static ref ARG_ID: String = String::from("id");
-
-    /// Setting this environment variable to any value will enable the experimental feature "Select
-    /// by Specific Attributes".
-    static ref DISABLE_EXPERIMENTAL_FEATURE_SELECT_BY_SPECIFIC_ATTRIBUTE_NAMES: bool =
-        !std::env::var("GRAPH_ENABLE_SELECT_BY_SPECIFIC_ATTRIBUTES").is_ok();
-
-    static ref RESULT_SIZE_WARN: usize = std::env::var("GRAPH_GRAPHQL_WARN_RESULT_SIZE")
-        .map(|s| s.parse::<usize>().expect("`GRAPH_GRAPHQL_WARN_RESULT_SIZE` is a number"))
-        .unwrap_or(std::usize::MAX);
-
-    static ref RESULT_SIZE_ERROR: usize = std::env::var("GRAPH_GRAPHQL_ERROR_RESULT_SIZE")
-        .map(|s| s.parse::<usize>().expect("`GRAPH_GRAPHQL_ERROR_RESULT_SIZE` is a number"))
-        .unwrap_or(std::usize::MAX);
 }
 
 /// Intermediate data structure to hold the results of prefetching entities
@@ -57,7 +45,7 @@ struct Node {
     /// the keys and values of the `children` map, but not of the map itself
     children_weight: usize,
 
-    entity: BTreeMap<String, r::Value>,
+    entity: BTreeMap<Word, r::Value>,
     /// We are using an `Rc` here for two reasons: it allows us to defer
     /// copying objects until the end, when converting to `q::Value` forces
     /// us to copy any child that is referenced by multiple parents. It also
@@ -98,11 +86,11 @@ struct Node {
     /// copies to the point where we need to convert to `q::Value`, and it
     /// would be desirable to base the data structure that GraphQL execution
     /// uses on a DAG rather than a tree, but that's a good amount of work
-    children: BTreeMap<String, Vec<Rc<Node>>>,
+    children: BTreeMap<Word, Vec<Rc<Node>>>,
 }
 
-impl From<BTreeMap<String, r::Value>> for Node {
-    fn from(entity: BTreeMap<String, r::Value>) -> Self {
+impl From<BTreeMap<Word, r::Value>> for Node {
+    fn from(entity: BTreeMap<Word, r::Value>) -> Self {
         Node {
             children_weight: entity.weight(),
             entity,
@@ -163,7 +151,10 @@ impl From<Node> for r::Value {
     fn from(node: Node) -> Self {
         let mut map = node.entity;
         for (key, nodes) in node.children.into_iter() {
-            map.insert(format!("prefetch:{}", key), node_list_as_value(nodes));
+            map.insert(
+                format!("prefetch:{}", key).into(),
+                node_list_as_value(nodes),
+            );
         }
         r::Value::object(map)
     }
@@ -192,7 +183,7 @@ impl Node {
     }
 
     fn get(&self, key: &str) -> Option<&r::Value> {
-        self.entity.get(key)
+        self.entity.get(&key.into())
     }
 
     fn typename(&self) -> &str {
@@ -212,7 +203,7 @@ impl Node {
         let key_weight = response_key.weight();
 
         self.children_weight += nodes_weight(&nodes) + key_weight;
-        let old = self.children.insert(response_key, nodes);
+        let old = self.children.insert(response_key.into(), nodes);
         if let Some(old) = old {
             self.children_weight -= nodes_weight(&old) + key_weight;
         }
@@ -311,7 +302,7 @@ impl<'a> JoinCond<'a> {
                             .filter_map(|(id, node)| {
                                 node.get(*child_field)
                                     .and_then(|value| value.as_str())
-                                    .and_then(|child_id| Some((id, child_id.to_owned())))
+                                    .map(|child_id| (id, child_id.to_owned()))
                             })
                             .unzip();
 
@@ -341,13 +332,16 @@ impl<'a> JoinCond<'a> {
                                         }
                                         _ => None,
                                     })
-                                    .and_then(|child_ids| Some((id, child_ids)))
+                                    .map(|child_ids| (id, child_ids))
                             })
                             .unzip();
                         (ids, ParentLink::List(child_ids))
                     }
                 };
-                (ids, EntityLink::Parent(parent_link))
+                (
+                    ids,
+                    EntityLink::Parent(self.parent_type.clone(), parent_link),
+                )
             }
         }
     }
@@ -409,7 +403,7 @@ impl<'a> Join<'a> {
                 .get("g$parent_id")
                 .expect("the query that produces 'child' ensures there is always a g$parent_id")
             {
-                r::Value::String(key) => grouped.entry(&key).or_default().push(child.clone()),
+                r::Value::String(key) => grouped.entry(key).or_default().push(child.clone()),
                 _ => unreachable!("the parent_id returned by the query is always a string"),
             }
         }
@@ -424,13 +418,13 @@ impl<'a> Join<'a> {
             // query are always joined first, and may then be overwritten by the merged selection
             // set under the object type condition. See also: e0d6da3e-60cf-41a5-b83c-b60a7a766d4a
             let values = parent.id().ok().and_then(|id| grouped.get(&*id).cloned());
-            parent.set_children(response_key.to_owned(), values.unwrap_or(vec![]));
+            parent.set_children(response_key.to_owned(), values.unwrap_or_default());
         }
     }
 
     fn windows(
         &self,
-        parents: &Vec<&mut Node>,
+        parents: &[&mut Node],
         multiplicity: ChildMultiplicity,
         previous_collection: &EntityCollection,
     ) -> Vec<EntityWindow> {
@@ -486,17 +480,16 @@ pub fn run(
     resolver: &StoreResolver,
     ctx: &ExecutionContext<impl Resolver>,
     selection_set: &a::SelectionSet,
-    result_size: &ResultSizeMetrics,
-) -> Result<r::Value, Vec<QueryExecutionError>> {
-    execute_root_selection_set(resolver, ctx, selection_set).map(|nodes| {
-        result_size.observe(nodes.weight());
-        r::Value::Object(nodes.into_iter().fold(Object::default(), |mut map, node| {
-            // For root nodes, we only care about the children
-            for (key, nodes) in node.children.into_iter() {
-                map.insert(format!("prefetch:{}", key), node_list_as_value(nodes));
-            }
-            map
-        }))
+    graphql_metrics: &GraphQLMetrics,
+) -> Result<(r::Value, Trace), Vec<QueryExecutionError>> {
+    execute_root_selection_set(resolver, ctx, selection_set).map(|(nodes, trace)| {
+        graphql_metrics.observe_query_result_size(nodes.weight());
+        let obj = Object::from_iter(nodes.into_iter().flat_map(|node| {
+            node.children
+                .into_iter()
+                .map(|(key, nodes)| (format!("prefetch:{}", key), node_list_as_value(nodes)))
+        }));
+        (r::Value::Object(obj), trace)
     })
 }
 
@@ -505,17 +498,30 @@ fn execute_root_selection_set(
     resolver: &StoreResolver,
     ctx: &ExecutionContext<impl Resolver>,
     selection_set: &a::SelectionSet,
-) -> Result<Vec<Node>, Vec<QueryExecutionError>> {
+) -> Result<(Vec<Node>, Trace), Vec<QueryExecutionError>> {
+    let trace = Trace::root(
+        &ctx.query.query_text,
+        &ctx.query.variables_text,
+        &ctx.query.query_id,
+        resolver.block_number(),
+        ctx.trace,
+    );
     // Execute the root selection set against the root query type
-    execute_selection_set(resolver, ctx, make_root_node(), selection_set)
+    execute_selection_set(resolver, ctx, make_root_node(), trace, selection_set)
 }
 
-fn check_result_size(logger: &Logger, size: usize) -> Result<(), QueryExecutionError> {
-    if size > *RESULT_SIZE_ERROR {
-        return Err(QueryExecutionError::ResultTooBig(size, *RESULT_SIZE_ERROR));
+fn check_result_size<'a>(
+    ctx: &'a ExecutionContext<impl Resolver>,
+    size: usize,
+) -> Result<(), QueryExecutionError> {
+    if size > ENV_VARS.graphql.warn_result_size {
+        warn!(ctx.logger, "Large query result"; "size" => size, "query_id" => &ctx.query.query_id);
     }
-    if size > *RESULT_SIZE_WARN {
-        warn!(logger, "Large query result"; "size" => size);
+    if size > ENV_VARS.graphql.error_result_size {
+        return Err(QueryExecutionError::ResultTooBig(
+            size,
+            ENV_VARS.graphql.error_result_size,
+        ));
     }
     Ok(())
 }
@@ -524,8 +530,9 @@ fn execute_selection_set<'a>(
     resolver: &StoreResolver,
     ctx: &'a ExecutionContext<impl Resolver>,
     mut parents: Vec<Node>,
+    mut parent_trace: Trace,
     selection_set: &a::SelectionSet,
-) -> Result<Vec<Node>, Vec<QueryExecutionError>> {
+) -> Result<(Vec<Node>, Trace), Vec<QueryExecutionError>> {
     let schema = &ctx.query.schema;
     let mut errors: Vec<QueryExecutionError> = Vec::new();
 
@@ -571,29 +578,35 @@ fn execute_selection_set<'a>(
             // If this environment variable is set, the program will use an empty collection that,
             // effectively, causes the `AttributeNames::All` variant to be used as a fallback value for all
             // queries.
-            let collected_columns =
-                if *DISABLE_EXPERIMENTAL_FEATURE_SELECT_BY_SPECIFIC_ATTRIBUTE_NAMES {
-                    SelectedAttributes(BTreeMap::new())
-                } else {
-                    SelectedAttributes::for_field(field)?
-                };
+            let collected_columns = if !ENV_VARS.enable_select_by_specific_attributes {
+                SelectedAttributes(BTreeMap::new())
+            } else {
+                SelectedAttributes::for_field(field)?
+            };
 
             match execute_field(
                 resolver,
-                &ctx,
+                ctx,
                 &parents,
                 &join,
                 field,
                 field_type,
                 collected_columns,
             ) {
-                Ok(children) => {
-                    match execute_selection_set(resolver, ctx, children, &field.selection_set) {
-                        Ok(children) => {
+                Ok((children, trace)) => {
+                    match execute_selection_set(
+                        resolver,
+                        ctx,
+                        children,
+                        trace,
+                        &field.selection_set,
+                    ) {
+                        Ok((children, trace)) => {
                             Join::perform(&mut parents, children, field.response_key());
                             let weight =
                                 parents.iter().map(|parent| parent.weight()).sum::<usize>();
-                            check_result_size(&ctx.logger, weight)?;
+                            check_result_size(ctx, weight)?;
+                            parent_trace.push(field.response_key(), trace);
                         }
                         Err(mut e) => errors.append(&mut e),
                     }
@@ -606,7 +619,7 @@ fn execute_selection_set<'a>(
     }
 
     if errors.is_empty() {
-        Ok(parents)
+        Ok((parents, parent_trace))
     } else {
         Err(errors)
     }
@@ -616,12 +629,12 @@ fn execute_selection_set<'a>(
 fn execute_field(
     resolver: &StoreResolver,
     ctx: &ExecutionContext<impl Resolver>,
-    parents: &Vec<&mut Node>,
+    parents: &[&mut Node],
     join: &Join<'_>,
     field: &a::Field,
     field_definition: &s::Field,
     selected_attrs: SelectedAttributes,
-) -> Result<Vec<Node>, Vec<QueryExecutionError>> {
+) -> Result<(Vec<Node>, Trace), Vec<QueryExecutionError>> {
     let multiplicity = if sast::is_list_or_non_null_list_field(field_definition) {
         ChildMultiplicity::Many
     } else {
@@ -629,17 +642,12 @@ fn execute_field(
     };
 
     fetch(
-        ctx.logger.clone(),
-        resolver.store.as_ref(),
+        resolver,
+        ctx,
         parents,
-        &join,
+        join,
         field,
         multiplicity,
-        ctx.query.schema.types_for_interface(),
-        resolver.block_number(),
-        ctx.max_first,
-        ctx.max_skip,
-        ctx.query.query_id.clone(),
         selected_attrs,
     )
     .map_err(|e| vec![e])
@@ -649,29 +657,26 @@ fn execute_field(
 /// in which child field to look for the parent's id/join field. When
 /// `is_single` is `true`, there is at most one child per parent.
 fn fetch(
-    logger: Logger,
-    store: &(impl QueryStore + ?Sized),
-    parents: &Vec<&mut Node>,
+    resolver: &StoreResolver,
+    ctx: &ExecutionContext<impl Resolver>,
+    parents: &[&mut Node],
     join: &Join<'_>,
     field: &a::Field,
     multiplicity: ChildMultiplicity,
-    types_for_interface: &BTreeMap<EntityType, Vec<s::ObjectType>>,
-    block: BlockNumber,
-    max_first: u32,
-    max_skip: u32,
-    query_id: String,
     selected_attrs: SelectedAttributes,
-) -> Result<Vec<Node>, QueryExecutionError> {
+) -> Result<(Vec<Node>, Trace), QueryExecutionError> {
     let mut query = build_query(
         join.child_type,
-        block,
+        resolver.block_number(),
         field,
-        types_for_interface,
-        max_first,
-        max_skip,
+        ctx.query.schema.types_for_interface(),
+        ctx.max_first,
+        ctx.max_skip,
         selected_attrs,
+        &ctx.query.schema,
     )?;
-    query.query_id = Some(query_id);
+    query.trace = ctx.trace;
+    query.query_id = Some(ctx.query.query_id.clone());
 
     if multiplicity == ChildMultiplicity::Single {
         // Suppress 'order by' in lookups of scalar values since
@@ -679,7 +684,7 @@ fn fetch(
         query.order = EntityOrder::Unordered;
     }
 
-    query.logger = Some(logger);
+    query.logger = Some(ctx.logger.cheap_clone());
     if let Some(r::Value::String(id)) = field.argument_value(ARG_ID.as_str()) {
         query.filter = Some(
             EntityFilter::Equal(ARG_ID.to_owned(), StoreValue::from(id.to_owned()))
@@ -692,13 +697,19 @@ fn fetch(
         // by the parent list
         let windows = join.windows(parents, multiplicity, &query.collection);
         if windows.is_empty() {
-            return Ok(vec![]);
+            return Ok((vec![], Trace::None));
         }
         query.collection = EntityCollection::Window(windows);
     }
-    store
+    resolver
+        .store
         .find_query_values(query)
-        .map(|entities| entities.into_iter().map(|entity| entity.into()).collect())
+        .map(|(values, trace)| {
+            (
+                values.into_iter().map(|entity| entity.into()).collect(),
+                trace,
+            )
+        })
 }
 
 #[derive(Debug, Default, Clone)]
@@ -718,7 +729,13 @@ impl SelectedAttributes {
                         .map(|field_type| !field_type.is_derived())
                         .unwrap_or(false)
                 })
-                .map(|field| field.name.clone())
+                .filter_map(|field| {
+                    if field.name.starts_with("__") {
+                        None
+                    } else {
+                        Some(field.name.clone())
+                    }
+                })
                 .collect();
             map.insert(
                 object_type.name().to_string(),

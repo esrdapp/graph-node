@@ -34,7 +34,7 @@ Any data format that has a well-defined 1:1 mapping with the [IPLD Canonical For
 | --- | --- | --- |
 | **kind** | *String | The type of data source. Possible values: *ethereum/contract*.|
 | **name** | *String* | The name of the source data. Will be used to generate APIs in the mapping and also for self-documentation purposes. |
-| **network** | *String* | For blockchains, this describes which network the subgraph targets. For Ethereum, this can be any of "mainnet", "rinkeby", "kovan", "ropsten", "goerli", "poa-core", "poa-sokol", "xdai", "matic", "mumbai", "fantom", "bsc" or "clover". Developers could look for an up to date list in the graph-cli [*code*](https://github.com/graphprotocol/graph-cli/blob/master/src/commands/init.js#L43-L57).|
+| **network** | *String* | For blockchains, this describes which network the subgraph targets. For Ethereum, this can be any of "mainnet", "rinkeby", "kovan", "ropsten", "goerli", "poa-core", "poa-sokol", "xdai", "matic", "mumbai", "fantom", "bsc" or "clover". Developers could look for an up to date list in the graph-cli [*code*](https://github.com/graphprotocol/graph-cli/blob/main/packages/cli/src/protocols/index.js#L70-L107).|
 | **source** | [*EthereumContractSource*](#151-ethereumcontractsource) | The source data on a blockchain such as Ethereum. |
 | **mapping** | [*Mapping*](#152-mapping) | The transformation logic applied to the data prior to being indexed. |
 
@@ -87,8 +87,13 @@ The `mapping` field may be one of the following supported mapping manifests:
 | Field | Type | Description |
 | --- | --- | --- |
 | **handler** | *String* | The name of an exported function in the mapping script that should handle the specified event. |
-| **filter** | optional *String* | The name of the filter that will be applied to decide on which blocks will trigger the mapping. If none is supplied, the handler will be called on every block. |
+| **filter** | optional *BlockHandlerFilter* | Definition of the filter to apply. If none is supplied, the handler will be called on every block. |
 
+#### 1.5.2.4.1 BlockHandlerFilter
+
+| Field | Type | Description |
+| --- | --- | --- |
+| **kind** | *String* | The selected block handler filter. Only option for now: `call`: This will only run the handler if the block contains at least one call to the data source contract. |
 
 ## 1.6 Path
 A path has one field `path`, which either refers to a path of a file on the local dev machine or an [IPLD link](https://github.com/ipld/specs/).

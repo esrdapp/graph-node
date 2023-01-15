@@ -6,7 +6,10 @@ use anyhow::Error;
 use async_trait::async_trait;
 use futures::sync::mpsc;
 
-use crate::blockchain::TriggerWithHandler;
+use crate::components::store::SubgraphFork;
+use crate::data_source::{
+    DataSource, DataSourceTemplate, MappingTrigger, TriggerData, TriggerWithHandler,
+};
 use crate::prelude::*;
 use crate::{blockchain::Blockchain, components::subgraph::SharedProofOfIndexing};
 use crate::{components::metrics::HistogramVec, runtime::DeterministicHostError};
@@ -43,25 +46,36 @@ impl MappingError {
 /// Common trait for runtime host implementations.
 #[async_trait]
 pub trait RuntimeHost<C: Blockchain>: Send + Sync + 'static {
+    fn data_source(&self) -> &DataSource<C>;
+
     fn match_and_decode(
         &self,
-        trigger: &C::TriggerData,
-        block: Arc<C::Block>,
+        trigger: &TriggerData<C>,
+        block: &Arc<C::Block>,
         logger: &Logger,
-    ) -> Result<Option<TriggerWithHandler<C>>, Error>;
+    ) -> Result<Option<TriggerWithHandler<MappingTrigger<C>>>, Error>;
 
     async fn process_mapping_trigger(
         &self,
         logger: &Logger,
         block_ptr: BlockPtr,
-        trigger: TriggerWithHandler<C>,
+        trigger: TriggerWithHandler<MappingTrigger<C>>,
         state: BlockState<C>,
         proof_of_indexing: SharedProofOfIndexing,
+        debug_fork: &Option<Arc<dyn SubgraphFork>>,
     ) -> Result<BlockState<C>, MappingError>;
 
     /// Block number in which this host was created.
     /// Returns `None` for static data sources.
     fn creation_block_number(&self) -> Option<BlockNumber>;
+
+    /// Offchain data sources track done_at which is set once the
+    /// trigger has been processed.
+    fn done_at(&self) -> Option<BlockNumber>;
+
+    /// Convenience function to avoid leaking internal representation of
+    /// mutable number. Calling this on OnChain Datasources is a noop.
+    fn set_done_at(&self, block: Option<BlockNumber>);
 }
 
 pub struct HostMetrics {
@@ -72,7 +86,7 @@ pub struct HostMetrics {
 
 impl HostMetrics {
     pub fn new(
-        registry: Arc<impl MetricsRegistry>,
+        registry: Arc<dyn MetricsRegistry>,
         subgraph: &str,
         stopwatch: StopwatchMetrics,
     ) -> Self {
@@ -149,8 +163,8 @@ pub trait RuntimeHostBuilder<C: Blockchain>: Clone + Send + Sync + 'static {
         &self,
         network_name: String,
         subgraph_id: DeploymentHash,
-        data_source: C::DataSource,
-        top_level_templates: Arc<Vec<C::DataSourceTemplate>>,
+        data_source: DataSource<C>,
+        top_level_templates: Arc<Vec<DataSourceTemplate<C>>>,
         mapping_request_sender: mpsc::Sender<Self::Req>,
         metrics: Arc<HostMetrics>,
     ) -> Result<Self::Host, Error>;
@@ -158,7 +172,7 @@ pub trait RuntimeHostBuilder<C: Blockchain>: Clone + Send + Sync + 'static {
     /// Spawn a mapping and return a channel for mapping requests. The sender should be able to be
     /// cached and shared among mappings that use the same wasm file.
     fn spawn_mapping(
-        raw_module: Vec<u8>,
+        raw_module: &[u8],
         logger: Logger,
         subgraph_id: DeploymentHash,
         metrics: Arc<HostMetrics>,

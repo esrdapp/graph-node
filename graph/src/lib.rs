@@ -18,11 +18,15 @@ pub mod cheap_clone;
 
 pub mod ipfs_client;
 
+pub mod data_source;
+
 pub mod blockchain;
 
 pub mod runtime;
 
 pub mod firehose;
+
+pub mod substreams;
 
 /// Helpers for parsing environment variables.
 pub mod env;
@@ -35,12 +39,14 @@ pub use task_spawn::{
 
 pub use anyhow;
 pub use bytes;
+pub use itertools;
 pub use parking_lot;
 pub use petgraph;
 pub use prometheus;
 pub use semver;
 pub use slog;
-pub use stable_hash;
+pub use stable_hash_legacy;
+pub use tokio;
 pub use tokio_stream;
 pub use url;
 
@@ -58,6 +64,7 @@ pub mod prelude {
     pub use async_trait::async_trait;
     pub use bigdecimal;
     pub use chrono;
+    pub use envconfig;
     pub use ethabi;
     pub use futures::future;
     pub use futures::prelude::*;
@@ -68,9 +75,11 @@ pub mod prelude {
     pub use futures03::sink::SinkExt as _;
     pub use futures03::stream::{StreamExt as _, TryStreamExt};
     pub use hex;
+    pub use isatty;
     pub use lazy_static::lazy_static;
     pub use prost;
     pub use rand;
+    pub use regex;
     pub use reqwest;
     pub use serde;
     pub use serde_derive::{Deserialize, Serialize};
@@ -92,54 +101,55 @@ pub mod prelude {
     pub type DynTryFuture<'a, Ok = (), Err = Error> =
         Pin<Box<dyn futures03::Future<Output = Result<Ok, Err>> + Send + 'a>>;
 
-    pub use crate::blockchain::BlockPtr;
+    pub use crate::blockchain::{BlockHash, BlockPtr};
 
     pub use crate::components::ethereum::{
         EthereumBlock, EthereumBlockWithCalls, EthereumCall, LightEthereumBlock,
         LightEthereumBlockExt,
     };
     pub use crate::components::graphql::{
-        GraphQlRunner, QueryLoadManager, SubscriptionResultFuture,
+        GraphQLMetrics, GraphQlRunner, QueryLoadManager, SubscriptionResultFuture,
     };
     pub use crate::components::link_resolver::{JsonStreamValue, JsonValueStream, LinkResolver};
     pub use crate::components::metrics::{
-        aggregate::Aggregate, stopwatch::StopwatchMetrics, Collector, Counter, CounterVec, Gauge,
-        GaugeVec, Histogram, HistogramOpts, HistogramVec, MetricsRegistry, Opts, PrometheusError,
-        Registry,
+        aggregate::Aggregate, stopwatch::StopwatchMetrics, subgraph::*, Collector, Counter,
+        CounterVec, Gauge, GaugeVec, Histogram, HistogramOpts, HistogramVec, MetricsRegistry, Opts,
+        PrometheusError, Registry,
     };
-    pub use crate::components::server::admin::JsonRpcServer;
     pub use crate::components::server::index_node::IndexNodeServer;
-    pub use crate::components::server::metrics::MetricsServer;
     pub use crate::components::server::query::GraphQLServer;
     pub use crate::components::server::subscription::SubscriptionServer;
     pub use crate::components::store::{
-        AttributeNames, BlockNumber, ChainStore, ChildMultiplicity, EntityCache, EntityChange,
-        EntityChangeOperation, EntityCollection, EntityFilter, EntityKey, EntityLink,
-        EntityModification, EntityOperation, EntityOrder, EntityQuery, EntityRange, EntityWindow,
-        EthereumCallCache, ParentLink, PoolWaitStats, QueryStore, QueryStoreManager, StoreError,
-        StoreEvent, StoreEventStream, StoreEventStreamBox, SubgraphStore, WindowAttribute,
-        BLOCK_NUMBER_MAX, SUBSCRIPTION_THROTTLE_INTERVAL,
+        AttributeNames, BlockNumber, CachedEthereumCall, ChainStore, Child, ChildMultiplicity,
+        EntityCache, EntityChange, EntityChangeOperation, EntityCollection, EntityFilter,
+        EntityLink, EntityModification, EntityOperation, EntityOrder, EntityQuery, EntityRange,
+        EntityWindow, EthereumCallCache, ParentLink, PartialBlockPtr, PoolWaitStats, QueryStore,
+        QueryStoreManager, StoreError, StoreEvent, StoreEventStream, StoreEventStreamBox,
+        SubgraphStore, UnfailOutcome, WindowAttribute, BLOCK_NUMBER_MAX,
     };
     pub use crate::components::subgraph::{
         BlockState, DataSourceTemplateInfo, HostMetrics, RuntimeHost, RuntimeHostBuilder,
         SubgraphAssignmentProvider, SubgraphInstanceManager, SubgraphRegistrar,
         SubgraphVersionSwitchingMode,
     };
+    pub use crate::components::trigger_processor::TriggerProcessor;
+    pub use crate::components::versions::{ApiVersion, FeatureFlag};
     pub use crate::components::{transaction_receipt, EventConsumer, EventProducer};
+    pub use crate::env::ENV_VARS;
 
     pub use crate::cheap_clone::CheapClone;
     pub use crate::data::graphql::{
         shape_hash::shape_hash, SerializableValue, TryFromValue, ValueMap,
     };
     pub use crate::data::query::{
-        Query, QueryError, QueryExecutionError, QueryResult, QueryVariables,
+        Query, QueryError, QueryExecutionError, QueryResult, QueryTarget, QueryVariables,
     };
     pub use crate::data::schema::{ApiSchema, Schema};
     pub use crate::data::store::ethereum::*;
     pub use crate::data::store::scalar::{BigDecimal, BigInt, BigIntSign};
     pub use crate::data::store::{
-        AssignmentEvent, Attribute, Entity, NodeId, SubscriptionFilter, ToEntityId, ToEntityKey,
-        TryIntoEntity, Value, ValueType,
+        AssignmentEvent, Attribute, Entity, NodeId, SubscriptionFilter, TryIntoEntity, Value,
+        ValueType,
     };
     pub use crate::data::subgraph::schema::SubgraphDeploymentEntity;
     pub use crate::data::subgraph::{

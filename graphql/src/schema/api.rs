@@ -24,8 +24,9 @@ pub enum APISchemaError {
     FulltextSearchNonDeterministic,
 }
 
+// The followoing types are defined in meta.graphql
 const BLOCK_HEIGHT: &str = "Block_height";
-
+const CHANGE_BLOCK_FILTER_NAME: &str = "BlockChangedFilter";
 const ERROR_POLICY_TYPE: &str = "_SubgraphErrorPolicy_";
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -82,10 +83,6 @@ pub fn api_schema(input_schema: &Document) -> Result<Document, APISchemaError> {
 
     // Refactor: Don't clone the schema.
     let mut schema = input_schema.clone();
-    add_directives(&mut schema);
-    add_builtin_scalar_types(&mut schema)?;
-    add_order_direction_enum(&mut schema);
-    add_block_height_type(&mut schema);
     add_meta_field_type(&mut schema);
     add_types_for_object_types(&mut schema, &object_types)?;
     add_types_for_interface_types(&mut schema, &interface_types)?;
@@ -105,144 +102,6 @@ pub fn api_schema(input_schema: &Document) -> Result<Document, APISchemaError> {
     Ok(schema)
 }
 
-/// Adds built-in GraphQL scalar types (`Int`, `String` etc.) to the schema.
-fn add_builtin_scalar_types(schema: &mut Document) -> Result<(), APISchemaError> {
-    for name in [
-        "Boolean",
-        "ID",
-        "Int",
-        "BigDecimal",
-        "String",
-        "Bytes",
-        "BigInt",
-    ]
-    .iter()
-    {
-        match schema.get_named_type(name) {
-            None => {
-                let typedef = TypeDefinition::Scalar(ScalarType {
-                    position: Pos::default(),
-                    description: None,
-                    name: name.to_string(),
-                    directives: vec![],
-                });
-                let def = Definition::TypeDefinition(typedef);
-                schema.definitions.push(def);
-            }
-            Some(_) => return Err(APISchemaError::TypeExists(name.to_string())),
-        }
-    }
-    Ok(())
-}
-
-/// Add directive definitions for our custom directives
-fn add_directives(schema: &mut Document) {
-    let entity = Definition::DirectiveDefinition(DirectiveDefinition {
-        position: Pos::default(),
-        description: None,
-        name: "entity".to_owned(),
-        arguments: vec![],
-        locations: vec![DirectiveLocation::Object],
-        repeatable: false,
-    });
-
-    let derived_from = Definition::DirectiveDefinition(DirectiveDefinition {
-        position: Pos::default(),
-        description: None,
-        name: "derivedFrom".to_owned(),
-        arguments: vec![InputValue {
-            position: Pos::default(),
-            description: None,
-            name: "field".to_owned(),
-            value_type: Type::NamedType("String".to_owned()),
-            default_value: None,
-            directives: vec![],
-        }],
-        locations: vec![DirectiveLocation::FieldDefinition],
-        repeatable: false,
-    });
-
-    let subgraph_id = Definition::DirectiveDefinition(DirectiveDefinition {
-        position: Pos::default(),
-        description: None,
-        name: "subgraphId".to_owned(),
-        arguments: vec![InputValue {
-            position: Pos::default(),
-            description: None,
-            name: "id".to_owned(),
-            value_type: Type::NamedType("String".to_owned()),
-            default_value: None,
-            directives: vec![],
-        }],
-        locations: vec![DirectiveLocation::Object],
-        repeatable: false,
-    });
-
-    schema.definitions.push(entity);
-    schema.definitions.push(derived_from);
-    schema.definitions.push(subgraph_id);
-}
-
-/// Adds a global `OrderDirection` type to the schema.
-fn add_order_direction_enum(schema: &mut Document) {
-    let typedef = TypeDefinition::Enum(EnumType {
-        position: Pos::default(),
-        description: None,
-        name: "OrderDirection".to_string(),
-        directives: vec![],
-        values: ["asc", "desc"]
-            .iter()
-            .map(|name| EnumValue {
-                position: Pos::default(),
-                description: None,
-                name: name.to_string(),
-                directives: vec![],
-            })
-            .collect(),
-    });
-    let def = Definition::TypeDefinition(typedef);
-    schema.definitions.push(def);
-}
-
-/// Adds a global `Block_height` type to the schema. The `block` argument
-/// accepts values of this type
-fn add_block_height_type(schema: &mut Document) {
-    let typedef = TypeDefinition::InputObject(InputObjectType {
-        position: Pos::default(),
-        description: None,
-        name: BLOCK_HEIGHT.to_string(),
-        directives: vec![],
-        fields: vec![
-            InputValue {
-                position: Pos::default(),
-                description: None,
-                name: "hash".to_owned(),
-                value_type: Type::NamedType("Bytes".to_owned()),
-                default_value: None,
-                directives: vec![],
-            },
-            InputValue {
-                position: Pos::default(),
-                description: None,
-                name: "number".to_owned(),
-                value_type: Type::NamedType("Int".to_owned()),
-                default_value: None,
-                directives: vec![],
-            },
-            InputValue {
-                position: Pos::default(),
-                description: None,
-                name: "number_gte".to_owned(),
-                value_type: Type::NamedType("Int".to_owned()),
-                default_value: None,
-                directives: vec![],
-            },
-        ],
-    });
-    let def = Definition::TypeDefinition(typedef);
-    schema.definitions.push(def);
-}
-
 /// Adds a global `_Meta_` type to the schema. The `_meta` field
 /// accepts values of this type
 fn add_meta_field_type(schema: &mut Document) {
@@ -260,7 +119,7 @@ fn add_meta_field_type(schema: &mut Document) {
 
 fn add_types_for_object_types(
     schema: &mut Document,
-    object_types: &Vec<&ObjectType>,
+    object_types: &[&ObjectType],
 ) -> Result<(), APISchemaError> {
     for object_type in object_types {
         if !object_type.name.eq(SCHEMA_TYPE_NAME) {
@@ -289,7 +148,7 @@ fn add_order_by_type(
     type_name: &str,
     fields: &[Field],
 ) -> Result<(), APISchemaError> {
-    let type_name = format!("{}_orderBy", type_name).to_string();
+    let type_name = format!("{}_orderBy", type_name);
 
     match schema.get_named_type(&type_name) {
         None => {
@@ -323,15 +182,42 @@ fn add_filter_type(
     type_name: &str,
     fields: &[Field],
 ) -> Result<(), APISchemaError> {
-    let filter_type_name = format!("{}_filter", type_name).to_string();
+    let filter_type_name = format!("{}_filter", type_name);
     match schema.get_named_type(&filter_type_name) {
         None => {
+            let mut generated_filter_fields = field_input_values(schema, fields)?;
+            generated_filter_fields.push(block_changed_filter_argument());
+
+            if !ENV_VARS.graphql.disable_bool_filters {
+                generated_filter_fields.push(InputValue {
+                    position: Pos::default(),
+                    description: None,
+                    name: "and".to_string(),
+                    value_type: Type::ListType(Box::new(Type::NamedType(
+                        filter_type_name.to_owned(),
+                    ))),
+                    default_value: None,
+                    directives: vec![],
+                });
+
+                generated_filter_fields.push(InputValue {
+                    position: Pos::default(),
+                    description: None,
+                    name: "or".to_string(),
+                    value_type: Type::ListType(Box::new(Type::NamedType(
+                        filter_type_name.to_owned(),
+                    ))),
+                    default_value: None,
+                    directives: vec![],
+                });
+            }
+
             let typedef = TypeDefinition::InputObject(InputObjectType {
                 position: Pos::default(),
                 description: None,
                 name: filter_type_name,
                 directives: vec![],
-                fields: field_input_values(schema, fields)?,
+                fields: generated_filter_fields,
             });
             let def = Definition::TypeDefinition(typedef);
             schema.definitions.push(def);
@@ -367,21 +253,22 @@ fn field_filter_input_values(
                 .ok_or_else(|| APISchemaError::TypeNotFound(name.clone()))?;
             Ok(match named_type {
                 TypeDefinition::Object(_) | TypeDefinition::Interface(_) => {
-                    // Only add `where` filter fields for object and interface fields
-                    // if they are not @derivedFrom
-                    if ast::get_derived_from_directive(field).is_some() {
-                        vec![]
-                    } else {
+                    let mut input_values = match ast::get_derived_from_directive(field) {
+                        // Only add `where` filter fields for object and interface fields
+                        // if they are not @derivedFrom
+                        Some(_) => vec![],
                         // We allow filtering with `where: { other: "some-id" }` and
                         // `where: { others: ["some-id", "other-id"] }`. In both cases,
                         // we allow ID strings as the values to be passed to these
                         // filters.
-                        field_scalar_filter_input_values(
+                        None => field_scalar_filter_input_values(
                             schema,
                             field,
                             &ScalarType::new(String::from("String")),
-                        )
-                    }
+                        ),
+                    };
+                    extend_with_child_filter_input_value(field, name, &mut input_values);
+                    input_values
                 }
                 TypeDefinition::Scalar(ref t) => field_scalar_filter_input_values(schema, field, t),
                 TypeDefinition::Enum(ref t) => field_enum_filter_input_values(schema, field, t),
@@ -389,7 +276,7 @@ fn field_filter_input_values(
             })
         }
         Type::ListType(ref t) => {
-            Ok(field_list_filter_input_values(schema, field, t).unwrap_or(vec![]))
+            Ok(field_list_filter_input_values(schema, field, t).unwrap_or_default())
         }
         Type::NonNullType(ref t) => field_filter_input_values(schema, field, t),
     }
@@ -404,7 +291,18 @@ fn field_scalar_filter_input_values(
     match field_type.name.as_ref() {
         "BigInt" => vec!["", "not", "gt", "lt", "gte", "lte", "in", "not_in"],
         "Boolean" => vec!["", "not", "in", "not_in"],
-        "Bytes" => vec!["", "not", "in", "not_in", "contains", "not_contains"],
+        "Bytes" => vec![
+            "",
+            "not",
+            "gt",
+            "lt",
+            "gte",
+            "lte",
+            "in",
+            "not_in",
+            "contains",
+            "not_contains",
+        ],
         "BigDecimal" => vec!["", "not", "gt", "lt", "gte", "lte", "in", "not_in"],
         "ID" => vec!["", "not", "gt", "lt", "gte", "lte", "in", "not_in"],
         "Int" => vec!["", "not", "gt", "lt", "gte", "lte", "in", "not_in"],
@@ -418,11 +316,17 @@ fn field_scalar_filter_input_values(
             "in",
             "not_in",
             "contains",
+            "contains_nocase",
             "not_contains",
+            "not_contains_nocase",
             "starts_with",
+            "starts_with_nocase",
             "not_starts_with",
+            "not_starts_with_nocase",
             "ends_with",
+            "ends_with_nocase",
             "not_ends_with",
+            "not_ends_with_nocase",
         ],
         _ => vec!["", "not"],
     }
@@ -436,6 +340,19 @@ fn field_scalar_filter_input_values(
         input_value(&field.name, filter_type, value_type)
     })
     .collect()
+}
+
+/// Appends a child filter to input values
+fn extend_with_child_filter_input_value(
+    field: &Field,
+    field_type_name: &String,
+    input_values: &mut Vec<InputValue>,
+) {
+    input_values.push(input_value(
+        &format!("{}_", field.name),
+        "",
+        Type::NamedType(format!("{}_filter", field_type_name)),
+    ));
 }
 
 /// Generates `*_filter` input values for the given enum field.
@@ -466,37 +383,55 @@ fn field_list_filter_input_values(
     field_type: &Type,
 ) -> Option<Vec<InputValue>> {
     // Only add a filter field if the type of the field exists in the schema
-    ast::get_type_definition_from_type(schema, field_type).and_then(|typedef| {
+    ast::get_type_definition_from_type(schema, field_type).map(|typedef| {
         // Decide what type of values can be passed to the filter. In the case
         // one-to-many or many-to-many object or interface fields that are not
         // derived, we allow ID strings to be passed on.
-        let input_field_type = match typedef {
-            TypeDefinition::Interface(_) | TypeDefinition::Object(_) => {
+        // Adds child filter only to object types.
+        let (input_field_type, parent_type_name) = match typedef {
+            TypeDefinition::Object(ObjectType { name, .. })
+            | TypeDefinition::Interface(InterfaceType { name, .. }) => {
                 if ast::get_derived_from_directive(field).is_some() {
-                    return None;
+                    (None, Some(name.clone()))
                 } else {
-                    Type::NamedType("String".into())
+                    (Some(Type::NamedType("String".into())), Some(name.clone()))
                 }
             }
-            TypeDefinition::Scalar(ref t) => Type::NamedType(t.name.to_owned()),
-            TypeDefinition::Enum(ref t) => Type::NamedType(t.name.to_owned()),
-            TypeDefinition::InputObject(_) | TypeDefinition::Union(_) => return None,
+            TypeDefinition::Scalar(ref t) => (Some(Type::NamedType(t.name.to_owned())), None),
+            TypeDefinition::Enum(ref t) => (Some(Type::NamedType(t.name.to_owned())), None),
+            TypeDefinition::InputObject(_) | TypeDefinition::Union(_) => (None, None),
         };
 
-        Some(
-            vec!["", "not", "contains", "not_contains"]
-                .into_iter()
-                .map(|filter_type| {
-                    input_value(
-                        &field.name,
-                        filter_type,
-                        Type::ListType(Box::new(Type::NonNullType(Box::new(
-                            input_field_type.clone(),
-                        )))),
-                    )
-                })
-                .collect(),
-        )
+        let mut input_values: Vec<InputValue> = match input_field_type {
+            None => {
+                vec![]
+            }
+            Some(input_field_type) => vec![
+                "",
+                "not",
+                "contains",
+                "contains_nocase",
+                "not_contains",
+                "not_contains_nocase",
+            ]
+            .into_iter()
+            .map(|filter_type| {
+                input_value(
+                    &field.name,
+                    filter_type,
+                    Type::ListType(Box::new(Type::NonNullType(Box::new(
+                        input_field_type.clone(),
+                    )))),
+                )
+            })
+            .collect(),
+        };
+
+        if let Some(parent) = parent_type_name {
+            extend_with_child_filter_input_value(field, &parent, &mut input_values);
+        }
+
+        input_values
     })
 }
 
@@ -533,7 +468,7 @@ fn add_query_type(
         .map(|t| t.name.as_str())
         .filter(|name| !name.eq(&SCHEMA_TYPE_NAME))
         .chain(interface_types.iter().map(|t| t.name.as_str()))
-        .flat_map(|name| query_fields_for_type(name))
+        .flat_map(query_fields_for_type)
         .collect::<Vec<Field>>();
     let mut fulltext_fields = schema
         .get_fulltext_directives()
@@ -550,7 +485,7 @@ fn add_query_type(
         name: type_name,
         implements_interfaces: vec![],
         directives: vec![],
-        fields: fields,
+        fields,
     });
     let def = Definition::TypeDefinition(typedef);
     schema.definitions.push(def);
@@ -604,7 +539,7 @@ fn query_field_for_fulltext(fulltext: &Directive) -> Option<Field> {
         position: Pos::default(),
         description: None,
         name,
-        arguments: arguments,
+        arguments,
         field_type: Type::NonNullType(Box::new(Type::ListType(Box::new(Type::NonNullType(
             Box::new(Type::NamedType(entity_name.into())),
         ))))), // included entity type name
@@ -661,6 +596,17 @@ fn block_argument() -> InputValue {
         ),
         name: "block".to_string(),
         value_type: Type::NamedType(BLOCK_HEIGHT.to_owned()),
+        default_value: None,
+        directives: vec![],
+    }
+}
+
+fn block_changed_filter_argument() -> InputValue {
+    InputValue {
+        position: Pos::default(),
+        description: Some("Filter for the block changed event.".to_owned()),
+        name: "_change_block".to_string(),
+        value_type: Type::NamedType(CHANGE_BLOCK_FILTER_NAME.to_owned()),
         default_value: None,
         directives: vec![],
     }
@@ -751,27 +697,27 @@ fn collection_arguments_for_named_type(type_name: &str) -> Vec<InputValue> {
     // `first` and `skip` should be non-nullable, but the Apollo graphql client
     // exhibts non-conforming behaviour by erroing if no value is provided for a
     // non-nullable field, regardless of the presence of a default.
-    let mut skip = input_value(&"skip".to_string(), "", Type::NamedType("Int".to_string()));
+    let mut skip = input_value("skip", "", Type::NamedType("Int".to_string()));
     skip.default_value = Some(Value::Int(0.into()));
 
-    let mut first = input_value(&"first".to_string(), "", Type::NamedType("Int".to_string()));
+    let mut first = input_value("first", "", Type::NamedType("Int".to_string()));
     first.default_value = Some(Value::Int(100.into()));
 
     let args = vec![
         skip,
         first,
         input_value(
-            &"orderBy".to_string(),
+            "orderBy",
             "",
             Type::NamedType(format!("{}_orderBy", type_name)),
         ),
         input_value(
-            &"orderDirection".to_string(),
+            "orderDirection",
             "",
             Type::NamedType("OrderDirection".to_string()),
         ),
         input_value(
-            &"where".to_string(),
+            "where",
             "",
             Type::NamedType(format!("{}_filter", type_name)),
         ),
@@ -821,9 +767,9 @@ fn add_field_arguments(
     for input_interface_type in input_schema.get_interface_type_definitions() {
         for input_field in &input_interface_type.fields {
             if let Some(input_reference_type) =
-                ast::get_referenced_entity_type(input_schema, &input_field)
+                ast::get_referenced_entity_type(input_schema, input_field)
             {
-                if ast::is_list_or_non_null_list_field(&input_field) {
+                if ast::is_list_or_non_null_list_field(input_field) {
                     // Get corresponding interface type and field in the output schema
                     let interface_type =
                         ast::get_interface_type_mut(schema, &input_interface_type.name)
@@ -977,14 +923,14 @@ mod tests {
             .get_named_type("User_filter")
             .expect("User_filter type is missing in derived API schema");
 
-        let filter_type = match user_filter {
+        let user_filter_type = match user_filter {
             TypeDefinition::InputObject(t) => Some(t),
             _ => None,
         }
         .expect("User_filter type is not an input object");
 
         assert_eq!(
-            filter_type
+            user_filter_type
                 .fields
                 .iter()
                 .map(|field| field.name.to_owned())
@@ -1007,19 +953,30 @@ mod tests {
                 "name_in",
                 "name_not_in",
                 "name_contains",
+                "name_contains_nocase",
                 "name_not_contains",
+                "name_not_contains_nocase",
                 "name_starts_with",
+                "name_starts_with_nocase",
                 "name_not_starts_with",
+                "name_not_starts_with_nocase",
                 "name_ends_with",
+                "name_ends_with_nocase",
                 "name_not_ends_with",
+                "name_not_ends_with_nocase",
                 "favoritePetNames",
                 "favoritePetNames_not",
                 "favoritePetNames_contains",
+                "favoritePetNames_contains_nocase",
                 "favoritePetNames_not_contains",
+                "favoritePetNames_not_contains_nocase",
                 "pets",
                 "pets_not",
                 "pets_contains",
+                "pets_contains_nocase",
                 "pets_not_contains",
+                "pets_not_contains_nocase",
+                "pets_",
                 "favoriteFurType",
                 "favoriteFurType_not",
                 "favoriteFurType_in",
@@ -1033,16 +990,251 @@ mod tests {
                 "favoritePet_in",
                 "favoritePet_not_in",
                 "favoritePet_contains",
+                "favoritePet_contains_nocase",
                 "favoritePet_not_contains",
+                "favoritePet_not_contains_nocase",
                 "favoritePet_starts_with",
+                "favoritePet_starts_with_nocase",
                 "favoritePet_not_starts_with",
+                "favoritePet_not_starts_with_nocase",
                 "favoritePet_ends_with",
+                "favoritePet_ends_with_nocase",
                 "favoritePet_not_ends_with",
+                "favoritePet_not_ends_with_nocase",
+                "favoritePet_",
+                "leastFavoritePet_",
+                "mostFavoritePets_",
+                "_change_block",
+                "and",
+                "or"
             ]
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<String>>()
         );
+
+        let pets_field = user_filter_type
+            .fields
+            .iter()
+            .find(|field| field.name == "pets_")
+            .expect("pets_ field is missing");
+
+        assert_eq!(
+            pets_field.value_type.to_string(),
+            String::from("Pet_filter")
+        );
+
+        let pet_filter = schema
+            .get_named_type("Pet_filter")
+            .expect("Pet_filter type is missing in derived API schema");
+
+        let pet_filter_type = match pet_filter {
+            TypeDefinition::InputObject(t) => Some(t),
+            _ => None,
+        }
+        .expect("Pet_filter type is not an input object");
+
+        assert_eq!(
+            pet_filter_type
+                .fields
+                .iter()
+                .map(|field| field.name.to_owned())
+                .collect::<Vec<String>>(),
+            [
+                "id",
+                "id_not",
+                "id_gt",
+                "id_lt",
+                "id_gte",
+                "id_lte",
+                "id_in",
+                "id_not_in",
+                "name",
+                "name_not",
+                "name_gt",
+                "name_lt",
+                "name_gte",
+                "name_lte",
+                "name_in",
+                "name_not_in",
+                "name_contains",
+                "name_contains_nocase",
+                "name_not_contains",
+                "name_not_contains_nocase",
+                "name_starts_with",
+                "name_starts_with_nocase",
+                "name_not_starts_with",
+                "name_not_starts_with_nocase",
+                "name_ends_with",
+                "name_ends_with_nocase",
+                "name_not_ends_with",
+                "name_not_ends_with_nocase",
+                "mostHatedBy",
+                "mostHatedBy_not",
+                "mostHatedBy_contains",
+                "mostHatedBy_contains_nocase",
+                "mostHatedBy_not_contains",
+                "mostHatedBy_not_contains_nocase",
+                "mostHatedBy_",
+                "mostLovedBy",
+                "mostLovedBy_not",
+                "mostLovedBy_contains",
+                "mostLovedBy_contains_nocase",
+                "mostLovedBy_not_contains",
+                "mostLovedBy_not_contains_nocase",
+                "mostLovedBy_",
+                "_change_block",
+                "and",
+                "or"
+            ]
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<String>>()
+        );
+
+        let change_block_filter = user_filter_type
+            .fields
+            .iter()
+            .find(move |p| match p.name.as_str() {
+                "_change_block" => true,
+                _ => false,
+            })
+            .expect("_change_block field is missing in User_filter");
+
+        match &change_block_filter.value_type {
+            Type::NamedType(name) => assert_eq!(name.as_str(), "BlockChangedFilter"),
+            _ => panic!("_change_block field is not a named type"),
+        }
+
+        schema
+            .get_named_type("BlockChangedFilter")
+            .expect("BlockChangedFilter type is missing in derived API schema");
+    }
+
+    #[test]
+    fn api_schema_contains_object_type_with_field_interface() {
+        let input_schema = parse_schema(
+            r#"
+              interface Pet {
+                  id: ID!
+                  name: String!
+              }
+
+              type Dog implements Pet {
+                id: ID!
+                name: String!
+              }
+
+              type Cat implements Pet {
+                id: ID!
+                name: String!
+                owner: User!
+              }
+
+              type User {
+                  id: ID!
+                  name: String!
+                  pets: [Pet!]! @derivedFrom(field: "owner")
+                  favoritePet: Pet!
+              }
+            "#,
+        )
+        .expect("Failed to parse input schema");
+        let schema = api_schema(&input_schema).expect("Failed to derived API schema");
+
+        let user_filter = schema
+            .get_named_type("User_filter")
+            .expect("User_filter type is missing in derived API schema");
+
+        let user_filter_type = match user_filter {
+            TypeDefinition::InputObject(t) => Some(t),
+            _ => None,
+        }
+        .expect("User_filter type is not an input object");
+
+        assert_eq!(
+            user_filter_type
+                .fields
+                .iter()
+                .map(|field| field.name.to_owned())
+                .collect::<Vec<String>>(),
+            [
+                "id",
+                "id_not",
+                "id_gt",
+                "id_lt",
+                "id_gte",
+                "id_lte",
+                "id_in",
+                "id_not_in",
+                "name",
+                "name_not",
+                "name_gt",
+                "name_lt",
+                "name_gte",
+                "name_lte",
+                "name_in",
+                "name_not_in",
+                "name_contains",
+                "name_contains_nocase",
+                "name_not_contains",
+                "name_not_contains_nocase",
+                "name_starts_with",
+                "name_starts_with_nocase",
+                "name_not_starts_with",
+                "name_not_starts_with_nocase",
+                "name_ends_with",
+                "name_ends_with_nocase",
+                "name_not_ends_with",
+                "name_not_ends_with_nocase",
+                "pets_",
+                "favoritePet",
+                "favoritePet_not",
+                "favoritePet_gt",
+                "favoritePet_lt",
+                "favoritePet_gte",
+                "favoritePet_lte",
+                "favoritePet_in",
+                "favoritePet_not_in",
+                "favoritePet_contains",
+                "favoritePet_contains_nocase",
+                "favoritePet_not_contains",
+                "favoritePet_not_contains_nocase",
+                "favoritePet_starts_with",
+                "favoritePet_starts_with_nocase",
+                "favoritePet_not_starts_with",
+                "favoritePet_not_starts_with_nocase",
+                "favoritePet_ends_with",
+                "favoritePet_ends_with_nocase",
+                "favoritePet_not_ends_with",
+                "favoritePet_not_ends_with_nocase",
+                "favoritePet_",
+                "_change_block",
+                "and",
+                "or"
+            ]
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<String>>()
+        );
+
+        let change_block_filter = user_filter_type
+            .fields
+            .iter()
+            .find(move |p| match p.name.as_str() {
+                "_change_block" => true,
+                _ => false,
+            })
+            .expect("_change_block field is missing in User_filter");
+
+        match &change_block_filter.value_type {
+            Type::NamedType(name) => assert_eq!(name.as_str(), "BlockChangedFilter"),
+            _ => panic!("_change_block field is not a named type"),
+        }
+
+        schema
+            .get_named_type("BlockChangedFilter")
+            .expect("BlockChangedFilter type is missing in derived API schema");
     }
 
     #[test]

@@ -68,6 +68,20 @@ impl<T: IntoValue> IntoValue for Vec<T> {
     }
 }
 
+impl IntoValue for &[u8] {
+    #[inline]
+    fn into_value(self) -> r::Value {
+        r::Value::String(format!("0x{}", hex::encode(self)))
+    }
+}
+
+impl IntoValue for chrono::NaiveDate {
+    #[inline]
+    fn into_value(self) -> r::Value {
+        r::Value::String(self.format("%Y-%m-%d").to_string())
+    }
+}
+
 macro_rules! impl_into_values {
     ($(($T:ty, $V:ident)),*) => {
         $(
@@ -88,12 +102,12 @@ impl_into_values![(String, String), (f64, Float), (bool, Boolean)];
 macro_rules! object {
     ($($name:ident: $value:expr,)*) => {
         {
-            let mut result = $crate::data::value::Object::new();
+            let mut result = Vec::new();
             $(
                 let value = $crate::data::graphql::object_macro::IntoValue::into_value($value);
-                result.insert(stringify!($name).to_string(), value);
+                result.push((stringify!($name).to_string(), value));
             )*
-            $crate::prelude::r::Value::Object(result)
+            $crate::prelude::r::Value::Object($crate::data::value::Object::from_iter(result))
         }
     };
     ($($name:ident: $value:expr),*) => {
